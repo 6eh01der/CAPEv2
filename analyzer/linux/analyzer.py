@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 from threading import Thread
 from urllib.parse import urlencode
@@ -63,10 +64,22 @@ def dump_files():
     )
 
 
-def monitor_new_processes(parent_pid, options=None, interval=0.25):
+_DISABLED_OPTION_VALUES = ("0", "false", "no", "off")
+
+
+def _is_procdump_enabled(options):
+    """Check whether child process memory dumping is enabled."""
+    if not isinstance(options, Mapping):
+        return True
+    for key in ("procdump", "procmemdump"):
+        if key in options and str(options[key]).strip().lower() in _DISABLED_OPTION_VALUES:
+            return False
+    return True
+
+
+def monitor_new_processes(parent_pid, interval=0.25, options=None):
     """Continuously monitor for new child processes."""
-    procdump_val = str((options or {}).get("procdump", "1")).strip().lower()
-    do_procdump = procdump_val not in ("0", "false", "no", "off")
+    do_procdump = _is_procdump_enabled(options)
     known_processes = set(get_all_child_processes(parent_pid))
     while True:
         current_processes = set(get_all_child_processes(parent_pid))
@@ -325,7 +338,12 @@ class Analyzer:
             raise ValueError("No PID available to monitor.")
 
         # Start the monitoring thread before the analysis loop
-        monitor_thread = Thread(target=monitor_new_processes, args=(PID, self.options), daemon=True)
+        monitor_thread = Thread(
+            target=monitor_new_processes,
+            args=(PID,),
+            kwargs={"options": self.options},
+            daemon=True,
+        )
         monitor_thread.start()
 
         # Check in the options if the user toggled the timeout enforce. If so,
