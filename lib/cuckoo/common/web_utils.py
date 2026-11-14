@@ -9,7 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from random import choice
 from typing import Dict, List, Optional
@@ -17,15 +17,24 @@ from typing import Dict, List, Optional
 import magic
 import requests
 from django.http import HttpResponse
+from sqlalchemy import select
 
 from dev_utils.mongo_hooks import FILE_REF_KEY, FILES_COLL, NORMALIZED_FILE_FIELDS
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.hooks import apply_es_filter, apply_mongo_filter, apply_route_filter
 from lib.cuckoo.common.integrations.parse_pe import HAVE_PEFILE, IsPEImage, pefile
 from lib.cuckoo.common.objects import File
-from lib.cuckoo.common.path_utils import path_exists, path_get_filename, path_mkdir, path_write_file
+from lib.cuckoo.common.path_utils import (
+    magic_from_buffer,
+    magic_from_file,
+    path_exists,
+    path_get_filename,
+    path_mkdir,
+    path_write_file,
+)
 from lib.cuckoo.common.utils import (
     generate_fake_name,
+    get_cape_external_dir,
     get_ip_address,
     get_options,
     get_user_filename,
@@ -36,11 +45,15 @@ from lib.cuckoo.common.utils import (
 )
 from lib.cuckoo.core.data.task import (
     ALL_DB_STATUSES,
+    TASK_COMPLETED,
+    TASK_DISTRIBUTED,
     TASK_FAILED_ANALYSIS,
     TASK_FAILED_PROCESSING,
     TASK_FAILED_REPORTING,
+    TASK_PENDING,
     TASK_RECOVERED,
     TASK_REPORTED,
+    TASK_RUNNING,
     Task,
     )
 from lib.cuckoo.core.data.samples import Sample
@@ -195,14 +208,13 @@ def load_vms_exits(force: bool = False):
             _all_nodes_exits = {}
             if HAVE_DIST and dist_conf.distributed.enabled:
                 try:
-                    db = dist_session()
-                    for node in db.query(Node).all():
-                        if hasattr(node, "exitnodes"):
-                            for exit in node.exitnodes:
-                                _all_nodes_exits.setdefault(exit.name, []).append(node.name)
-                    db.close()
+                    with dist_session() as dist_db, dist_db.begin():
+                        for node in dist_db.scalars(select(Node)).all():
+                            if hasattr(node, "exitnodes"):
+                                for exit in node.exitnodes:
+                                    _all_nodes_exits.setdefault(exit.name, []).append(node.name)
                 except Exception as e:
-                    print(e)
+                    log.error("Failed to load exit nodes from the distributed DB: %s", e)
 
         cached_exits = dict(_all_nodes_exits)
 
@@ -236,17 +248,17 @@ def load_vms_tags(force: bool = False):
             all_tags = []
             if HAVE_DIST and dist_conf.distributed.enabled:
                 try:
-                    db = dist_session()
-                    for vm in db.query(Machine).all():
-                        all_tags += vm.tags
+                    with dist_session() as dist_db, dist_db.begin():
+                        for vm in dist_db.scalars(select(Machine)).all():
+                            all_tags += vm.tags or []
                     all_tags = sorted(filter(None, all_tags))
-                    db.close()
                 except Exception as e:
-                    print(e)
+                    log.error("Failed to load VM tags from the distributed DB: %s", e)
 
-            machines = Database().list_machines(include_reserved=True)
-            for machine in machines:
-                all_tags += [tag.name for tag in machine.tags if tag not in all_tags]
+            main_db = Database()
+            with main_db.transaction():
+                for machine in main_db.list_machines(include_reserved=True):
+                    all_tags += [tag.name for tag in machine.tags if tag not in all_tags]
 
             if all_tags:
                 _all_vms_tags = list(sorted(set(all_tags)))
@@ -287,9 +299,10 @@ def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
     """
 
     aggregation_command = [
-        {"$match": {"network.hosts.asn": {"$exists": True}}},
+        {"$match": {"network.hosts.asn": {"$gt": ""}}},
         {"$project": {"_id": 0, "network.hosts.asn": 1}},
         {"$unwind": "$network.hosts"},
+        {"$match": {"network.hosts.asn": {"$gt": ""}}},
         {"$group": {"_id": "$network.hosts.asn", "total": {"$sum": 1}}},
         {"$sort": {"total": -1}},
         {"$addFields": {"asn": "$_id"}},
@@ -300,13 +313,14 @@ def top_asn(date_since: datetime = False, results_limit: int = 20) -> dict:
     if date_since:
         aggregation_command[0]["$match"].setdefault("info.started", {"$gte": date_since.isoformat()})
 
-    if repconf.mongodb.enabled:
-        data = mongo_aggregate("analysis", aggregation_command)
-    else:
-        data = False
-
-    if data:
-        data = list(data)
+    try:
+        if repconf.mongodb.enabled:
+            data = list(mongo_aggregate("analysis", aggregation_command))
+        else:
+            data = False
+    except Exception as e:
+        log.warning("top_asn aggregation failed or timed out: %s", e)
+        data = []
 
     # save to cache
     top_asn.cache = (t, data)
@@ -343,9 +357,10 @@ def top_detections(date_since: datetime = False, results_limit: int = 20) -> dic
     """
 
     aggregation_command = [
-        {"$match": {"detections.family": {"$exists": True}}},
+        {"$match": {"detections.family": {"$gt": ""}}},
         {"$project": {"_id": 0, "detections.family": 1}},
         {"$unwind": "$detections"},
+        {"$match": {"detections.family": {"$gt": ""}}},
         {"$group": {"_id": "$detections.family", "total": {"$sum": 1}}},
         {"$sort": {"total": -1}},
         {"$addFields": {"family": "$_id"}},
@@ -356,26 +371,27 @@ def top_detections(date_since: datetime = False, results_limit: int = 20) -> dic
     if date_since:
         aggregation_command[0]["$match"].setdefault("info.started", {"$gte": date_since.isoformat()})
 
-    if repconf.mongodb.enabled:
-        data = mongo_aggregate("analysis", aggregation_command)
-    elif repconf.elasticsearchdb.enabled:
-        # ToDo update to new format
-        q = {
-            "query": {"bool": {"must": [{"exists": {"field": "detections.family"}}]}},
-            "size": 0,
-            "aggs": {"family": {"terms": {"field": "detections.family.keyword", "size": results_limit}}},
-        }
+    try:
+        if repconf.mongodb.enabled:
+            data = list(mongo_aggregate("analysis", aggregation_command))
+        elif repconf.elasticsearchdb.enabled:
+            # ToDo update to new format
+            q = {
+                "query": {"bool": {"must": [{"exists": {"field": "detections.family"}}]}},
+                "size": 0,
+                "aggs": {"family": {"terms": {"field": "detections.family.keyword", "size": results_limit}}},
+            }
 
-        if date_since:
-            q["query"]["bool"]["must"].append({"range": {"info.started": {"gte": date_since.isoformat()}}})
+            if date_since:
+                q["query"]["bool"]["must"].append({"range": {"info.started": {"gte": date_since.isoformat()}}})
 
-        res = es.search(index=get_analysis_index(), body=apply_es_filter(q))
-        data = [{"total": r["doc_count"], "family": r["key"]} for r in res["aggregations"]["family"]["buckets"]]
-    else:
-        data = False
-
-    if data:
-        data = list(data)
+            res = es.search(index=get_analysis_index(), body=apply_es_filter(q))
+            data = [{"total": r["doc_count"], "family": r["key"]} for r in res["aggregations"]["family"]["buckets"]]
+        else:
+            data = False
+    except Exception as e:
+        log.warning("top_detections aggregation failed or timed out: %s", e)
+        data = []
 
     # save to cache
     top_detections.cache = (t, data)
@@ -435,7 +451,11 @@ def get_stats_per_category(category: str, date_since: datetime) -> List[Dict[str
         },
         {"$limit": 20},
     ]
-    return mongo_aggregate("analysis", aggregation_command)
+    try:
+        return list(mongo_aggregate("analysis", aggregation_command))
+    except Exception as e:
+        log.warning("get_stats_per_category(%s) aggregation failed or timed out: %s", category, e)
+        return []
 
 
 def statistics(s_days: int) -> dict:
@@ -500,15 +520,15 @@ def statistics(s_days: int) -> dict:
             details[module_name.split(".")[-1]].setdefault(name, entry)
 
     top_samples = {}
-    added_tasks = (
-        db.session.query(Task).join(Sample, Task.sample_id == Sample.id).filter(Task.added_on.between(date_since, date_till)).all()
-    )
-    tasks = (
-        db.session.query(Task)
-        .join(Sample, Task.sample_id == Sample.id)
-        .filter(Task.completed_on.between(date_since, date_till))
-        .all()
-    )
+    with db.transaction():
+        added_tasks = db.session.scalars(
+            select(Task.added_on).join(Sample, Task.sample_id == Sample.id).where(Task.added_on.between(date_since, date_till))
+        ).all()
+        tasks = db.session.execute(
+            select(Task.completed_on, Task.status, Sample.sha256)
+            .join(Sample, Task.sample_id == Sample.id)
+            .where(Task.completed_on.between(date_since, date_till))
+        ).all()
     details["total"] = len(tasks)
     details["average"] = f"{round(details['total'] / s_days, 2):.2f}"
     details["tasks"] = {}
@@ -521,17 +541,17 @@ def statistics(s_days: int) -> dict:
             details["tasks"][day].setdefault("added", 0)
         if day not in top_samples:
             top_samples.setdefault(day, {})
-        if task.sample.sha256 not in top_samples[day]:
-            top_samples[day].setdefault(task.sample.sha256, 0)
-        top_samples[day][task.sample.sha256] += 1
+        if task.sha256 not in top_samples[day]:
+            top_samples[day].setdefault(task.sha256, 0)
+        top_samples[day][task.sha256] += 1
         # details["tasks"][day]["added"] += 1
         if task.status in ("failed_analysis", "failed_reporting", "failed_processing"):
             details["tasks"][day]["failed"] += 1
         elif task.status == "reported":
             details["tasks"][day]["reported"] += 1
 
-    for added_task in added_tasks or []:
-        day = added_task.added_on.strftime("%Y-%m-%d")
+    for added_on in added_tasks or []:
+        day = added_on.strftime("%Y-%m-%d")
         if day not in details["tasks"]:
             continue
         details["tasks"][day]["added"] += 1
@@ -542,12 +562,10 @@ def statistics(s_days: int) -> dict:
 
     if HAVE_DIST and dist_conf.distributed.enabled:
         details["distributed_tasks"] = {}
-        dist_db = dist_session()
-        dist_tasks = dist_db.query(DTask).filter(DTask.clock.between(date_since, date_till)).all()
-        id2name = {}
-        # load node names
-        for node in dist_db.query(Node).all() or []:
-            id2name.setdefault(node.id, node.name)
+        with dist_session() as dist_db, dist_db.begin():
+            dist_tasks = dist_db.execute(select(DTask.clock, DTask.node_id).where(DTask.clock.between(date_since, date_till))).all()
+            # load node names
+            id2name = dict(dist_db.execute(select(Node.id, Node.name)).all())
 
         for task in dist_tasks or []:
             day = task.clock.strftime("%Y-%m-%d")
@@ -556,7 +574,6 @@ def statistics(s_days: int) -> dict:
             if id2name.get(task.node_id) not in details["distributed_tasks"][day]:
                 details["distributed_tasks"][day].setdefault(id2name[task.node_id], 0)
             details["distributed_tasks"][day][id2name[task.node_id]] += 1
-        dist_db.close()
 
         details["distributed_tasks"] = OrderedDict(sorted(details["distributed_tasks"].items(), key=lambda x: x[0], reverse=True))
 
@@ -628,9 +645,7 @@ def download_from_3rdparty(samples: str, opt_filename: str, details: dict) -> di
     Returns:
         dict: The updated details dictionary with information about the processed samples, including any errors encountered.
     """
-    folder = os.path.join(cfg.cuckoo.tmppath, "cape-external")
-    if not path_exists(folder):
-        path_mkdir(folder, exist_ok=True)
+    folder = get_cape_external_dir(tmppath=cfg.cuckoo.get("tmppath"))
     for h in get_hash_list(samples):
         safe_h = sanitize_filename(path_get_filename(h))
         if not safe_h or safe_h in (".", ".."):
@@ -667,6 +682,8 @@ def download_from_3rdparty(samples: str, opt_filename: str, details: dict) -> di
         if not details.get("content", False):
             content, service = downloader_services.download(h, details.get("apikey"))
             if not content:
+                with suppress(OSError):
+                    os.rmdir(base_dir)
                 details["errors"].append({h: "Can't download sample from external services"})
                 continue
             details["service"] = service
@@ -758,9 +775,11 @@ def get_magic_type(data: bytes) -> str:
     """
     try:
         if path_exists(data):
-            return magic.from_file(data)
+            res = magic_from_file(data, magic_module=magic)
         else:
-            return magic.from_buffer(data)
+            res = magic_from_buffer(data, magic_module=magic)
+        if res is not None:
+            return res
     except Exception as e:
         print(e, "get_magic_type")
 
@@ -1238,10 +1257,23 @@ hash_searches = {
     "sha512": "sha512",
 }
 
+files_searches = {
+    **hash_searches,
+    "clamav": "clamav",
+    "yaraname": "yara.name",
+    "capeyara": "cape_yara.name",
+    "imphash": "pe.imphash",
+    "iconhash": "pe.icon_hash",
+    "iconfuzzy": "pe.icon_fuzzy",
+    "dhash": "pe.icon_dhash",
+}
+
 search_term_map = {
     "id": "info.id",
     "ids": "info.id",
+    "options": "info.options",
     "tags_tasks": "info.id",
+    "user_tasks": "info.user_id",
     "package": "info.package",
     "ttp": "ttps.ttp",
     "malscore": "malscore",
@@ -1261,8 +1293,6 @@ search_term_map = {
     "signame": "signatures.name",
     "detections": "detections.family",
     "url": "target.url",
-    "iconhash": "static.pe.icon_hash",
-    "iconfuzzy": "static.pe.icon_fuzzy",
     "surihttp": "suricata.http",
     "suritls": "suricata.tls",
     "surisid": "suricata.alerts.sid",
@@ -1287,16 +1317,15 @@ search_term_map = {
     "tlp": "info.tlp",
     "ja3_hash": "suricata.tls.ja3.hash",
     "ja3_string": "suricata.tls.ja3.string",
-    "dhash": "static.pe.icon_dhash",
     "dport": ("network.tcp.dport", "network.udp.dport", "network.smtp_ex.dport"),
-    "sport": ("network.tcp.dport", "network.udp.dport", "network.smtp_ex.dport"),
+    "sport": ("network.tcp.sport", "network.udp.sport", "network.smtp_ex.sport"),
     "port": (
         "network.tcp.dport",
         "network.udp.dport",
         "network.smtp_ex.dport",
-        "network.tcp.dport",
-        "network.udp.dport",
-        "network.smtp_ex.dport",
+        "network.tcp.sport",
+        "network.udp.sport",
+        "network.smtp_ex.sport",
     ),
     # ToDo update schema
     # File_extra_info
@@ -1314,7 +1343,7 @@ search_term_map_repetetive_blocks = {
     "clamav": "clamav",
     "yaraname": "yara.name",
     "capeyara": "cape_yara.name",
-    "capetype": "cape_type.name",
+    "capetype": "cape_type",
     "md5": "md5",
     "sha1": "sha1",
     "sha256": "sha256",
@@ -1324,7 +1353,10 @@ search_term_map_repetetive_blocks = {
     "die": "die",
     "trid": "trid",
     "magika": "magika.label",
-    "imphash": "imphash",
+    "imphash": "pe.imphash",
+    "iconhash": "pe.icon_hash",
+    "iconfuzzy": "pe.icon_fuzzy",
+    "dhash": "pe.icon_dhash",
 }
 
 # ToDo review extracted_files key still the same
@@ -1429,13 +1461,14 @@ def perform_search(
         try:
             ids = []
             if term == "ids":
-                ids = value
+                if isinstance(value, str):
+                    ids = [int(v.strip()) for v in value.split(",") if v.strip().isdigit()]
+                elif isinstance(value, list):
+                    ids = [int(v) for v in value]
             elif term == "tags_tasks":
                 ids = [int(v.id) for v in db.list_tasks(tags_tasks_like=value, limit=search_limit)]
             elif term == "user_tasks":
-                if not user_id:
-                    ids = 0
-                else:
+                if user_id:
                     # ToDo allow to admin search by user tasks
                     ids = [int(v.id) for v in db.list_tasks(user_id=user_id, limit=search_limit)]
             else:
@@ -1446,17 +1479,17 @@ def perform_search(
                     query_val = {"$in": ids}
                 else:
                     term = "id"
-                    if isinstance(value, list):
-                        value = value[0]
-                    query_val = int(value)
+                    query_val = int(ids[0])
+            else:
+                return []
         except Exception as e:
             print(term, value, e)
+            return []
     elif term == "configs":
         # check if family name is string only maybe?
-        query_val = {f"{search_term_map[term]}.{value}": {"$exist": True}, "$options": "i"}
-    # ToDo proper implementation here
-    # elif term == "extracted_tool":
-    #    query_val = {"$exist": True}
+        query_val = {"$exists": True}
+    elif term == "extracted_tool":
+        query_val = {"$exists": True}
     elif term == "ttp":
         if validate_ttp(value):
             query_val = value.upper()
@@ -1465,7 +1498,8 @@ def perform_search(
     elif term == "malscore":
         query_val = {"$gte": float(value)}
     else:
-        if re.search(r"[\^\$\|\?\*\+\(\)\[\]\{\}]", value):
+        regex_chars = r"[\^\$\|\?\*\(\)\[\]\{\}]" if term == "ssdeep" else r"[\^\$\|\?\*\+\(\)\[\]\{\}]"
+        if re.search(regex_chars, value):
             if len(value) > 256:
                 raise ValueError("Regex too long")
             query_val = {"$regex": value, "$options": "i"}
@@ -1478,18 +1512,23 @@ def perform_search(
     if not search_limit:
         search_limit = web_cfg.general.get("search_limit", 50)
 
-    elif term == "configs":
-        # check if family name is string only maybe?
-        search_term_map[term] = f"CAPE.configs.{value}"
-        query_val = {"$exists": True}
-
     retval = []
     mongo_search_query = None
     if repconf.mongodb.enabled and query_val:
-        if term in hash_searches:
+        if not projection:
+            projection = perform_search_filters
+        if "target.file.sha256" in projection:
+            projection = dict(**projection)
+            projection[f"target.file.{FILE_REF_KEY}"] = 1
+
+        if term in files_searches:
             # The file details are uniq, and we store 1 to many. So where hash type is uniq, IDs are list
-            split_by = "," if "," in query_val else " "
-            query_filter_list = {"$in": [val.strip() for val in query_val.split(split_by)]}
+            if term in hash_searches and isinstance(query_val, str):
+                split_by = "," if "," in query_val else " "
+                query_filter_list = {"$in": [val.strip() for val in query_val.split(split_by) if val.strip()]}
+                match_query = {files_searches[term]: query_filter_list}
+            else:
+                match_query = {files_searches[term]: query_val}
             analysis_scope = apply_mongo_filter("analysis", {})
             privs_match = None
             if not privs:
@@ -1502,7 +1541,7 @@ def perform_search(
             limit_after_lookup = bool(analysis_scope or privs_match is not None)
             pipeline = [
                 # Stages 1-4: Find, unwind, group, sort IDs
-                {"$match": {hash_searches[term]: query_filter_list}},
+                {"$match": match_query},
                 {"$unwind": "$_task_ids"},
                 {"$group": {"_id": "$_task_ids"}},
                 {"$sort": {"_id": -1}},
@@ -1521,6 +1560,8 @@ def perform_search(
                         }
                     },
                     {"$unwind": "$task_doc"},
+                    # Stage 8: Make the task doc the new root (type check to prevent $replaceRoot crashes)
+                    {"$match": {"task_doc": {"$type": "object"}}},
                     {"$replaceRoot": {"newRoot": "$task_doc"}},
                 ]
             )
@@ -1533,29 +1574,24 @@ def perform_search(
                 pipeline.append({"$limit": search_limit})
 
             # Stage 9: Add your custom projection
-            pipeline.append({"$project": projection or perform_search_filters})
+            pipeline.append({"$project": projection})
 
             retval = list(mongo_aggregate(FILES_COLL, pipeline))
             if not retval:
                 return []
+        elif term == "configs":
+            mongo_search_query = {f"CAPE.configs.{value}": query_val}
+        elif term == "extracted_tool":
+            mongo_search_query = {"$or": [{f"{search_term}.{value}": query_val} for search_term in search_term_map[term]]}
         elif isinstance(search_term_map[term], str):
             mongo_search_query = {search_term_map[term]: query_val}
-        elif isinstance(search_term_map[term], list):
-            mongo_search_query = {search_term:query_val for search_term in search_term_map[term]}
+        elif isinstance(search_term_map[term], (list, tuple)):
+            mongo_search_query = {"$or": [{search_term: query_val} for search_term in search_term_map[term]]}
         else:
             print(f"Unknown search {term}:{value}")
             return []
 
         if not retval and mongo_search_query:
-            # Allow to overwrite perform_search_filters for custom results
-            if not projection:
-                projection = perform_search_filters
-            if "target.file.sha256" in projection:
-                projection = dict(**projection)
-                projection[f"target.file.{FILE_REF_KEY}"] = 1
-            if term in search_term_map_repetetive_blocks:
-                mongo_search_query = {"$or": [{path: condition} for path, condition in mongo_search_query.items()]}
-
             if not privs:
                 if force_bool(web_cfg.general.get("public_searches", True)):
                     if not force_bool(web_cfg.tlp.get("public_red", False)):
@@ -1581,7 +1617,18 @@ def perform_search(
 
         user_filter = _build_es_user_filter(privs, user_id)
 
-        if isinstance(search_term_map[term], str):
+        if term == "configs":
+            q = {"query": {"exists": {"field": f"CAPE.configs.{value}"}}}
+            if user_filter:
+                q = {"query": {"bool": {"must": [q["query"]], "filter": [user_filter]}}}
+            return [d["_source"] for d in es.search(index=get_analysis_index(), body=apply_es_filter(q), _source=_source_fields)["hits"]["hits"]]
+        elif term == "extracted_tool":
+            queries = [{"exists": {"field": f"{search_term}.{value}"}} for search_term in search_term_map[term]]
+            q = {"query": {"bool": {"should": queries, "minimum_should_match": 1}}}
+            if user_filter:
+                q["query"]["bool"]["filter"] = [user_filter]
+            return [d["_source"] for d in es.search(index=get_analysis_index(), body=apply_es_filter(q), _source=_source_fields)["hits"]["hits"]]
+        elif isinstance(search_term_map[term], str):
             q = {"query": {"match": {search_term_map[term]: value}}}
             if user_filter:
                 q = {"query": {"bool": {"must": [q["query"]], "filter": [user_filter]}}}
@@ -1596,11 +1643,9 @@ def perform_search(
 
 def force_int(value):
     try:
-        value = int(value)
+        return int(value)
     except Exception:
-        value = 0
-    finally:
-        return value
+        return 0
 
 
 def force_bool(value):
@@ -1611,8 +1656,6 @@ def force_bool(value):
         value: The value to be converted. It can be of any type.
 
     Returns:
-                # Stage 8: Make the task doc the new root (type check to prevent $replaceRoot crashes)
-                {"$match": {"task_doc": {"$type": "object"}}},
         bool: The boolean representation of the input value. Returns True if the value is one of
             ("true", "yes", "on", "1") (case insensitive). Returns False if the value is one of
             ("false", "no", "off", "0") (case insensitive), or if the value is None or empty.
@@ -1679,7 +1722,7 @@ def parse_request_arguments(request, keyword="POST"):
     memory = force_bool(getattr(request, keyword).get("memory", False))
     clock = getattr(request, keyword).get("clock", "")
     if not clock:
-        clock = datetime.utcfromtimestamp(0)
+        clock = datetime.fromtimestamp(0, timezone.utc).replace(tzinfo=None)
     elif "1970" in clock:
         clock = datetime.now().strftime("%m-%d-%Y %H:%M:%S")
     enforce_timeout = force_bool(getattr(request, keyword).get("enforce_timeout", False))
@@ -1848,3 +1891,208 @@ def get_running_commit() -> str:
     git_folder = Path(CUCKOO_ROOT, ".git")
     head_name = Path(git_folder, "HEAD").read_text().split("\n")[0].split(" ")[-1]
     return Path(git_folder, head_name).read_text().replace("\n", "")
+
+
+def init_static_analysis_storage(task, sha256: str = "") -> bool:
+    """Ensure storage/analyses/<task_id>/ and binary symlink exist so utils/process.py can finalize a stopped task."""
+    import shutil
+
+    from lib.cuckoo.common import constants as cuckoo_constants
+
+    root_dir = getattr(cuckoo_constants, "CUCKOO_ROOT", CUCKOO_ROOT)
+    task_id = getattr(task, "id", None)
+    if task_id is None:
+        return False
+
+    storage_dir = os.path.join(root_dir, "storage", "analyses", str(task_id))
+    path_mkdir(storage_dir, exist_ok=True)
+    for subdir in ("logs", "files", "aux"):
+        with suppress(Exception):
+            path_mkdir(os.path.join(storage_dir, subdir), exist_ok=True)
+
+    category = getattr(task, "category", "") or ""
+    if category == "url":
+        return True
+
+    target = getattr(task, "target", "") or ""
+    if not sha256:
+        sample = getattr(task, "sample", None)
+        if sample is not None:
+            sha256 = getattr(sample, "sha256", "") or ""
+        if not sha256 and target and path_exists(target):
+            with suppress(Exception):
+                sha256 = File(target).get_sha256()
+
+    binaries_dir = os.path.join(root_dir, "storage", "binaries")
+    path_mkdir(binaries_dir, exist_ok=True)
+    binary_store_path = os.path.join(binaries_dir, sha256) if sha256 else ""
+
+    if binary_store_path and not path_exists(binary_store_path) and target and path_exists(target):
+        with suppress(OSError, shutil.Error):
+            shutil.copy(target, binary_store_path)
+
+    source_path = binary_store_path if (binary_store_path and path_exists(binary_store_path)) else target
+    if source_path and path_exists(source_path):
+        dest_binary = os.path.join(storage_dir, "binary")
+        if not os.path.lexists(dest_binary):
+            try:
+                if hasattr(os, "symlink"):
+                    os.symlink(source_path, dest_binary)
+                else:
+                    shutil.copy(source_path, dest_binary)
+            except OSError:
+                with suppress(OSError, shutil.Error):
+                    shutil.copy(source_path, dest_binary)
+
+        if category == "pcap":
+            dest_pcap = os.path.join(storage_dir, "dump.pcap")
+            if not os.path.lexists(dest_pcap):
+                with suppress(OSError, shutil.Error):
+                    if hasattr(os, "symlink"):
+                        os.symlink(source_path, dest_pcap)
+                    else:
+                        shutil.copy(source_path, dest_pcap)
+
+    return True
+
+
+def stop_analysis_task(task_id: int, mode: str = "stop") -> dict:
+    """Stop an in-progress or pending analysis task so it transitions to post-processing/reporting.
+
+    Args:
+        task_id: Task ID to stop.
+        mode: ``"stop"`` (immediate host-side stop for pending/running/distributed tasks)
+              or ``"finish"`` (graceful in-guest finish via agent HTTP, falling back to host stop).
+    """
+    from urllib.parse import urljoin
+
+    from lib.cuckoo.core.data.db_common import _utcnow_naive
+    from lib.cuckoo.core.data.guests import Guest
+
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return {"error": True, "error_value": "Invalid task ID"}
+
+    task_status = None
+    guest_name = None
+    sample_sha256 = ""
+    pending_snapshot = None
+
+    with db.session.begin():
+        stmt = select(Task).where(Task.id == tid).with_for_update()
+        task = db.session.scalar(stmt)
+        if not task:
+            return {"error": True, "error_value": "Task does not exist"}
+
+        task_status = task.status
+        if getattr(task, "sample", None):
+            sample_sha256 = getattr(task.sample, "sha256", "") or ""
+        elif task.sample_id:
+            sample_obj = db.session.get(Sample, task.sample_id)
+            if sample_obj:
+                sample_sha256 = sample_obj.sha256 or ""
+
+        if task_status == TASK_PENDING:
+            if not task.started_on:
+                task.started_on = _utcnow_naive()
+            pending_snapshot = type(
+                "TaskSnapshot",
+                (),
+                {
+                    "id": task.id,
+                    "target": task.target,
+                    "category": task.category,
+                    "sample": type("S", (), {"sha256": sample_sha256})() if sample_sha256 else None,
+                },
+            )()
+            init_static_analysis_storage(pending_snapshot, sha256=sample_sha256)
+            db.set_task_status(task, TASK_COMPLETED)
+            return {"error": False, "data": "completed"}
+
+        if task_status == TASK_RUNNING:
+            guest = db.session.scalar(select(Guest).where(Guest.task_id == tid))
+            if guest is not None:
+                guest_name = guest.name
+                if mode == "stop":
+                    guest.status = "stopping"
+
+    if task_status == TASK_RUNNING:
+        if mode == "finish" and guest_name:
+            machine = db.view_machine(guest_name)
+            if machine and getattr(machine, "status", None) == "running" and getattr(machine, "ip", None):
+                try:
+                    guest_env = requests.get(f"http://{machine.ip}:8000/environ", timeout=5).json()
+                    complete_folder = hashlib.md5(f"cape-{tid}".encode()).hexdigest()
+                    dest_folder = ""
+                    if machine.platform == "windows":
+                        dest_folder = f"{guest_env['environ']['TMP']}\\{complete_folder}"
+                    elif machine.platform == "linux":
+                        dest_folder = f"{guest_env['environ'].get('TMP', '/tmp')}/{complete_folder}"
+                    if dest_folder:
+                        r = requests.post(f"http://{machine.ip}:8000/mkdir", data={"dirpath": dest_folder}, timeout=5)
+                        return {"error": r.status_code != 200, "data": r.text}
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("In-guest finish for task %s failed (%s); falling back to host stop", tid, exc)
+                    db.guest_set_status(tid, "stopping")
+                    return {"error": False, "data": "stopping"}
+            db.guest_set_status(tid, "stopping")
+            return {"error": False, "data": "stopping"}
+
+        if guest_name is None:
+            db.guest_set_status(tid, "stopping")
+        return {"error": False, "data": "stopping"}
+
+    if task_status == TASK_DISTRIBUTED and HAVE_DIST and dist_conf.distributed.enabled:
+        worker_url = None
+        worker_apikey = None
+        worker_task_id = None
+        completed_locally = False
+        try:
+            with dist_session() as dist_db, dist_db.begin():
+                dtask = dist_db.scalar(
+                    select(DTask).where(DTask.main_task_id == tid, DTask.finished.is_(False)).with_for_update()
+                )
+                if dtask is not None:
+                    if dtask.node_id and dtask.task_id:
+                        node = dist_db.get(Node, dtask.node_id)
+                        if node and node.url:
+                            worker_url = node.url
+                            worker_apikey = node.apikey
+                            worker_task_id = dtask.task_id
+                    else:
+                        dtask.finished = True
+                        dtask.retrieved = True
+                        dtask.notificated = True
+                        completed_locally = True
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Distributed stop lookup failed for task %s: %s", tid, exc)
+
+        if completed_locally:
+            with db.session.begin():
+                t = db.session.get(Task, tid)
+                if t:
+                    if not t.started_on:
+                        t.started_on = _utcnow_naive()
+                    init_static_analysis_storage(t, sha256=sample_sha256)
+                    db.set_task_status(t, TASK_COMPLETED)
+            return {"error": False, "data": "completed"}
+
+        if worker_url and worker_task_id:
+            try:
+                headers = {"Authorization": f"Token {worker_apikey}"} if worker_apikey else {}
+                r = requests.post(
+                    urljoin(worker_url, f"tasks/status/{worker_task_id}/"),
+                    headers=headers,
+                    json={"status": "stop"},
+                    verify=False,
+                    timeout=10,
+                )
+                return {"error": r.status_code != 200, "data": "stopping"}
+            except Exception as exc:
+                return {"error": True, "error_value": f"Failed to stop distributed worker task: {exc}"}
+
+    if task_status in (TASK_COMPLETED, TASK_REPORTED):
+        return {"error": False, "data": task_status}
+
+    return {"error": True, "error_value": f"Task cannot be stopped in state '{task_status}'"}

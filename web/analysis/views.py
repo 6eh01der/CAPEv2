@@ -45,7 +45,7 @@ import modules.processing.network as network
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.constants import ANALYSIS_BASE_PATH, CUCKOO_ROOT
 from lib.cuckoo.common.path_utils import path_exists, path_get_size, path_mkdir, path_read_file, path_safe
-from lib.cuckoo.common.utils import delete_folder, yara_detected
+from lib.cuckoo.common.utils import delete_folder, get_cape_external_dir, yara_detected
 from lib.cuckoo.common.web_utils import category_all_files, my_rate_minutes, my_rate_seconds, perform_search, rateblock, statistics
 from lib.cuckoo.core.database import Database, TasksMixIn
 from lib.cuckoo.core.data.task import TASK_PENDING, Task
@@ -106,6 +106,19 @@ try:
 except (NameError, ImportError):
     print("Can't import FLARE-CAPA")
 
+# Kesakode on-demand: online lookup deferred to a per-file button. Gated on the
+# [similarity] section (kesakode config lives there, not a [kesakode] section).
+HAVE_KESAKODE_ONDEMAND = False
+try:
+    if (
+        integrations_cfg.similarity.get("enabled", True)
+        and integrations_cfg.similarity.get("kesakode")
+        and integrations_cfg.similarity.get("kesakode_on_demand")
+    ):
+        HAVE_KESAKODE_ONDEMAND = True
+except Exception:
+    HAVE_KESAKODE_ONDEMAND = False
+
 HAVE_STRINGS = False
 if processing_cfg.strings.on_demand:
     from lib.cuckoo.common.integrations.strings import extract_strings
@@ -127,22 +140,25 @@ HAVE_XLM_DEOBF = False
 if processing_cfg.xlsdeobf.on_demand:
     from lib.cuckoo.common.integrations.XLMMacroDeobfuscator import HAVE_XLM_DEOBF, xlmdeobfuscate
 
+from lib.cuckoo.common.integrations.shellcode_utils import (
+    HAVE_SHELLCODE_CHECK,
+    run_shellcode_on_demand,
+    shellcode_on_demand_kwargs,
+)
+
 HAVE_VIRUSTOTAL = False
 if processing_cfg.virustotal.on_demand:
     from lib.cuckoo.common.integrations.virustotal import vt_lookup
 
     HAVE_VIRUSTOTAL = True
 
-if reporting_cfg.bingraph.on_demand:
-    try:
-        from binGraph.binGraph import generate_graphs as bingraph_gen
+try:
+    from binGraph.binGraph import generate_graphs as bingraph_gen
 
-        from modules.reporting.bingraph import bingraph_args_dict
+    from modules.reporting.bingraph import bingraph_args_dict
 
-        HAVE_BINGRAPH = True
-    except ImportError:
-        HAVE_BINGRAPH = False
-else:
+    HAVE_BINGRAPH = True
+except ImportError:
     HAVE_BINGRAPH = False
 
 HAVE_FLOSS = False
@@ -168,6 +184,19 @@ for cfile in ("integrations", "reporting", "processing", "auxiliary", "web", "di
                     on_demand_conf[item] = True
             else:
                 enabledconf[item] = False
+
+# Kesakode on-demand lives in [similarity] (kesakode_on_demand), not a section
+# with its own on_demand key, so surface it to the template explicitly.
+try:
+    _sim = Config("integrations").get("similarity")
+    if (
+        str(_sim.get("enabled", "yes")).lower() in ("yes", "true", "1", "on")
+        and str(_sim.get("kesakode", "no")).lower() in ("yes", "true", "1", "on")
+        and str(_sim.get("kesakode_on_demand", "no")).lower() in ("yes", "true", "1", "on")
+    ):
+        on_demand_conf["kesakode"] = True
+except Exception:
+    pass
 
 if enabledconf["mongodb"]:
     from bson.objectid import ObjectId
@@ -226,14 +255,19 @@ def _path_safe(path: str) -> bool:
 
 
 @lru_cache(maxsize=256)
+def _lookup_username_by_id(user_id):
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    u = User.objects.filter(pk=user_id).only("username").first()
+    return u.username if u else ""
+
+
 def _get_username_by_id(user_id):
     if not user_id:
         return ""
     try:
-        from django.contrib.auth import get_user_model
-        User = get_user_model()
-        u = User.objects.filter(pk=user_id).only("username").first()
-        return u.username if u else ""
+        return _lookup_username_by_id(user_id)
     except Exception:
         return ""
 
@@ -245,6 +279,8 @@ def get_tags_tasks(task_ids: list) -> str:
 
 def get_task_package(task_id: int) -> str:
     task = db.view_task(task_id)
+    if not task:
+        return ""
     task_dict = task.to_dict()
     return task_dict.get("package", "")
 
@@ -267,7 +303,8 @@ def get_analysis_info(db, id=-1, task=None, rtmp=None):
     # Submitter-supplied free-form tags. Stored in postgres as one
     # comma-separated string; split (and trim) here so the list view can
     # render one badge per tag, matching the per-job report.
-    raw_user_tags = get_tags_tasks([new["id"]]) or ""
+    raw_user_tags = new.get("tags_tasks") if "tags_tasks" in new else get_tags_tasks([new["id"]])
+    raw_user_tags = raw_user_tags or ""
     new.update({"user_task_tags": [t.strip() for t in raw_user_tags.split(",") if t.strip()]})
     new["submitter_username"] = _get_username_by_id(new.get("user_id") or 0)
 
@@ -461,6 +498,9 @@ def index(request, page=1):
                     "mlist_cnt": 1,
                     "f_mlist_cnt": 1,
                     "target.file.clamav": 1,
+                    "target.file.cape_yara": 1,
+                    "target.file.yara": 1,
+                    "target.file.file_ref": 1,
                     "suri_tls_cnt": 1,
                     "suri_alert_cnt": 1,
                     "suri_http_cnt": 1,
@@ -1765,78 +1805,81 @@ def load_files(request, task_id, category):
                 if category == "strace":
                     data["strace"] = data["behavior"]
             elif category == "tracee":
-                data = mongo_find_one("analysis", {"info.id": int(task_id)}, {category: 1, "info.tlp": 1, "_id": 0})
-                tmp = data["tracee"]
-                data["tracee"] = {}
-                data["tracee"]["rawData"] = tmp
-                with open("/opt/CAPEv2/data/linux/linux-syscalls.json", "r") as f:
-                    data["tracee"]["syscalls_decoded"] = json.load(f)
-                    data["tracee"]["syscalls_decoded"]["syscalls"].extend(
-                        [
-                            {"name": "stdio_over_socket", "cat": "SIGNATURISED"},
-                            {"name": "k8s_api_connection", "cat": "SIGNATURISED"},
-                            {"name": "aslr_inspection", "cat": "SIGNATURISED"},
-                            {"name": "proc_mem_code_injection", "cat": "SIGNATURISED"},
-                            {"name": "docker_abuse", "cat": "SIGNATURISED"},
-                            {"name": "scheduled_task_mod", "cat": "SIGNATURISED"},
-                            {"name": "ld_preload", "cat": "SIGNATURISED"},
-                            {"name": "cgroup_notify_on_release", "cat": "SIGNATURISED"},
-                            {"name": "default_loader_mod", "cat": "SIGNATURISED"},
-                            {"name": "sudoers_modification", "cat": "SIGNATURISED"},
-                            {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
-                            {"name": "system_request_key_mod", "cat": "SIGNATURISED"},
-                            {"name": "cgroup_release_agent", "cat": "SIGNATURISED"},
-                            {"name": "rcd_modification", "cat": "SIGNATURISED"},
-                            {"name": "core_pattern_modification", "cat": "SIGNATURISED"},
-                            {"name": "proc_kcore_read", "cat": "SIGNATURISED"},
-                            {"name": "proc_mem_access", "cat": "SIGNATURISED"},
-                            {"name": "hidden_file_created", "cat": "SIGNATURISED"},
-                            {"name": "anti_debugging", "cat": "SIGNATURISED"},
-                            {"name": "ptrace_code_injection", "cat": "SIGNATURISED"},
-                            {"name": "process_vm_write_inject", "cat": "SIGNATURISED"},
-                            {"name": "disk_mount", "cat": "SIGNATURISED"},
-                            {"name": "dynamic_code_loading", "cat": "SIGNATURISED"},
-                            {"name": "fileless_execution", "cat": "SIGNATURISED"},
-                            {"name": "illegitimate_shell", "cat": "SIGNATURISED"},
-                            {"name": "kernel_module_loading", "cat": "SIGNATURISED"},
-                            {"name": "k8s_cert_theft", "cat": "SIGNATURISED"},
-                            {"name": "proc_fops_hooking", "cat": "SIGNATURISED"},
-                            {"name": "syscall_hooking", "cat": "SIGNATURISED"},
-                            {"name": "dropped_executable", "cat": "SIGNATURISED"},
-                            {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
-                            {"name": "sched_process_exec", "cat": "SIGNATURISED"},
-                            {"name": "security_inode_unlink", "cat": "SIGNATURISED"},
-                            {"name": "security_bpf_prog", "cat": "SIGNATURISED"},
-                            {"name": "security_socket_connect", "cat": "SIGNATURISED"},
-                            {"name": "security_socket_accept", "cat": "SIGNATURISED"},
-                            {"name": "security_socket_bind", "cat": "SIGNATURISED"},
-                            {"name": "security_sb_mount", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_icmp", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_icmpv6", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_dns_request", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_dns_response", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_http_request", "cat": "SIGNATURISED"},
-                            {"name": "net_packet_http_response", "cat": "SIGNATURISED"},
-                            {"name": "process_vm_readv", "cat": "SIGNATURISED"},
-                            {"name": "process_vm_writev", "cat": "SIGNATURISED"},
-                            {"name": "finit_module", "cat": "SIGNATURISED"},
-                            {"name": "memfd_create", "cat": "SIGNATURISED"},
-                        ]
-                    )
-                data["tracee"]["syscalls"] = json.dumps(data["tracee"]["syscalls_decoded"])
-                data["tracee"]["cats"] = [
-                    "SIGNATURISED",
-                    "kernel",
-                    "fs",
-                    "mm",
-                    "net",
-                    "ipc",
-                    "security",
-                    "drivers",
-                    "io_uring",
-                    "crypto",
-                    "block",
-                ]
+                data = mongo_find_one("analysis", {"info.id": int(task_id)}, {category: 1, "info.tlp": 1, "_id": 0}) or {}
+                tmp = data.get("tracee")
+                if tmp:
+                    data["tracee"] = {"rawData": tmp}
+                    syscalls_path = os.path.join(settings.CUCKOO_PATH, "data", "linux", "linux-syscalls.json")
+                    with open(syscalls_path, "r") as f:
+                        data["tracee"]["syscalls_decoded"] = json.load(f)
+                        data["tracee"]["syscalls_decoded"]["syscalls"].extend(
+                            [
+                                {"name": "stdio_over_socket", "cat": "SIGNATURISED"},
+                                {"name": "k8s_api_connection", "cat": "SIGNATURISED"},
+                                {"name": "aslr_inspection", "cat": "SIGNATURISED"},
+                                {"name": "proc_mem_code_injection", "cat": "SIGNATURISED"},
+                                {"name": "docker_abuse", "cat": "SIGNATURISED"},
+                                {"name": "scheduled_task_mod", "cat": "SIGNATURISED"},
+                                {"name": "ld_preload", "cat": "SIGNATURISED"},
+                                {"name": "cgroup_notify_on_release", "cat": "SIGNATURISED"},
+                                {"name": "default_loader_mod", "cat": "SIGNATURISED"},
+                                {"name": "sudoers_modification", "cat": "SIGNATURISED"},
+                                {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
+                                {"name": "system_request_key_mod", "cat": "SIGNATURISED"},
+                                {"name": "cgroup_release_agent", "cat": "SIGNATURISED"},
+                                {"name": "rcd_modification", "cat": "SIGNATURISED"},
+                                {"name": "core_pattern_modification", "cat": "SIGNATURISED"},
+                                {"name": "proc_kcore_read", "cat": "SIGNATURISED"},
+                                {"name": "proc_mem_access", "cat": "SIGNATURISED"},
+                                {"name": "hidden_file_created", "cat": "SIGNATURISED"},
+                                {"name": "anti_debugging", "cat": "SIGNATURISED"},
+                                {"name": "ptrace_code_injection", "cat": "SIGNATURISED"},
+                                {"name": "process_vm_write_inject", "cat": "SIGNATURISED"},
+                                {"name": "disk_mount", "cat": "SIGNATURISED"},
+                                {"name": "dynamic_code_loading", "cat": "SIGNATURISED"},
+                                {"name": "fileless_execution", "cat": "SIGNATURISED"},
+                                {"name": "illegitimate_shell", "cat": "SIGNATURISED"},
+                                {"name": "kernel_module_loading", "cat": "SIGNATURISED"},
+                                {"name": "k8s_cert_theft", "cat": "SIGNATURISED"},
+                                {"name": "proc_fops_hooking", "cat": "SIGNATURISED"},
+                                {"name": "syscall_hooking", "cat": "SIGNATURISED"},
+                                {"name": "dropped_executable", "cat": "SIGNATURISED"},
+                                {"name": "sched_debug_recon", "cat": "SIGNATURISED"},
+                                {"name": "sched_process_exec", "cat": "SIGNATURISED"},
+                                {"name": "security_inode_unlink", "cat": "SIGNATURISED"},
+                                {"name": "security_bpf_prog", "cat": "SIGNATURISED"},
+                                {"name": "security_socket_connect", "cat": "SIGNATURISED"},
+                                {"name": "security_socket_accept", "cat": "SIGNATURISED"},
+                                {"name": "security_socket_bind", "cat": "SIGNATURISED"},
+                                {"name": "security_sb_mount", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_icmp", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_icmpv6", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_dns_request", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_dns_response", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_http_request", "cat": "SIGNATURISED"},
+                                {"name": "net_packet_http_response", "cat": "SIGNATURISED"},
+                                {"name": "process_vm_readv", "cat": "SIGNATURISED"},
+                                {"name": "process_vm_writev", "cat": "SIGNATURISED"},
+                                {"name": "finit_module", "cat": "SIGNATURISED"},
+                                {"name": "memfd_create", "cat": "SIGNATURISED"},
+                            ]
+                        )
+                    data["tracee"]["syscalls"] = json.dumps(data["tracee"]["syscalls_decoded"])
+                    data["tracee"]["cats"] = [
+                        "SIGNATURISED",
+                        "kernel",
+                        "fs",
+                        "mm",
+                        "net",
+                        "ipc",
+                        "security",
+                        "drivers",
+                        "io_uring",
+                        "crypto",
+                        "block",
+                    ]
+                else:
+                    data["tracee"] = {}
             elif category == "network":
                 data = mongo_find_one(
                     "analysis",
@@ -2783,6 +2826,11 @@ def report(request, task_id):
         except Exception:
             pass
     if not report:
+        task = None
+        with suppress(Exception):
+            task = db.view_task(task_id)
+        if task is not None and getattr(task, "status", "reported") != "reported":
+            return redirect("submission_status", task_id=task_id)
         if DISABLED_WEB:
             msg = "You need to enable Mongodb/ES to be able to use WEBGUI to see the analysis"
         else:
@@ -3477,47 +3525,53 @@ def procdump(request, task_id, process_id, start, end, zipped=False):
         dumpfile += ".zip"
         if not path_exists(dumpfile):
             return render(request, "error.html", {"error": "File not found"})
-        f = zipfile.ZipFile(dumpfile, "r")
-        tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=settings.TEMP_PATH)
-        tmp_file_path = f.extract(origname, path=tmpdir)
-        f.close()
-        dumpfile = tmp_file_path
+        ext_dir = get_cape_external_dir(tmppath=getattr(settings, "TEMP_PATH", None))
+        tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=ext_dir)
+        try:
+            with zipfile.ZipFile(dumpfile, "r") as f:
+                tmp_file_path = f.extract(origname, path=tmpdir)
+            dumpfile = tmp_file_path
+        except Exception:
+            with suppress(Exception):
+                delete_folder(tmpdir)
+            return render(request, "error.html", {"error": "File not found"})
 
     content_type = "application/octet-stream"
 
-    if not path_exists(dumpfile):
-        return render(request, "error.html", {"error": "File not found"})
+    try:
+        if not path_exists(dumpfile):
+            return render(request, "error.html", {"error": "File not found"})
 
-    file_name = f"{process_id}_{int(start, 16):x}.dmp"
-    with open(dumpfile, "rb") as file_item:
-        for proc in analysis.get("procmemory", []) or []:
-            if proc["pid"] == int(process_id):
-                s = BytesIO()
-                for memmap in proc["address_space"]:
-                    for chunk in memmap["chunks"]:
-                        if int(chunk["start"], 16) >= int(start, 16) and int(chunk["end"], 16) <= int(end, 16):
-                            file_item.seek(chunk["offset"])
-                            s.write(file_item.read(int(chunk["size"], 16)))
-                s.seek(0)
-                if zipped and HAVE_PYZIPPER:
-                    mem_zip = BytesIO()
-                    with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
-                        zf.setpassword(settings.ZIP_PWD)
-                        zf.writestr(file_name, s.getvalue())
-                    file_name += ".zip"
-                    content_type = "application/zip"
-                    mem_zip.seek(0)
-                    s = mem_zip
-                response = StreamingHttpResponse(s, content_type=content_type)
-                response["Content-Length"] = len(s.getvalue())
-                response["Content-Disposition"] = "attachment; filename={0}".format(file_name)
-                break
-
-    with suppress(Exception):
-        if tmp_file_path:
-            Path(tmp_file_path).unlink()
-        if tmpdir:
-            delete_folder(tmpdir)
+        file_name = f"{process_id}_{int(start, 16):x}.dmp"
+        with open(dumpfile, "rb") as file_item:
+            for proc in analysis.get("procmemory", []) or []:
+                if proc["pid"] == int(process_id):
+                    s = BytesIO()
+                    for memmap in proc["address_space"]:
+                        for chunk in memmap["chunks"]:
+                            if int(chunk["start"], 16) >= int(start, 16) and int(chunk["end"], 16) <= int(end, 16):
+                                file_item.seek(chunk["offset"])
+                                s.write(file_item.read(int(chunk["size"], 16)))
+                    s.seek(0)
+                    if zipped and HAVE_PYZIPPER:
+                        mem_zip = BytesIO()
+                        with pyzipper.AESZipFile(mem_zip, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
+                            zf.setpassword(settings.ZIP_PWD)
+                            zf.writestr(file_name, s.getvalue())
+                        file_name += ".zip"
+                        content_type = "application/zip"
+                        mem_zip.seek(0)
+                        s = mem_zip
+                    response = StreamingHttpResponse(s, content_type=content_type)
+                    response["Content-Length"] = len(s.getvalue())
+                    response["Content-Disposition"] = "attachment; filename={0}".format(file_name)
+                    break
+    finally:
+        with suppress(Exception):
+            if tmp_file_path:
+                Path(tmp_file_path).unlink()
+            if tmpdir:
+                delete_folder(tmpdir)
 
     if response:
         return response
@@ -3930,6 +3984,21 @@ def statistics_data(request, days=7):
     return render(request, "error.html", {"title": "Statistics", "error": "Provide days as number"})
 
 
+def _shellcode_on_demand_kwargs(task_id, category: str, sha256: str) -> dict | None:
+    """On-demand shellcode analysis only for what CAPE typed as shellcode
+    (Injected Shellcode/Data, Unpacked Shellcode) or a shellcode-package submission."""
+    return shellcode_on_demand_kwargs(
+        task_id,
+        category,
+        sha256,
+        db=db,
+        analysis_base_path=ANALYSIS_BASE_PATH,
+        path_safe_fn=_path_safe,
+        mongodb_enabled=bool(enabledconf.get("mongodb")),
+        mongo_find_one_fn=globals().get("mongo_find_one"),
+    )
+
+
 on_demand_config_mapper = {
     "bingraph": reporting_cfg,
     "flare_capa": integrations_cfg,
@@ -3938,6 +4007,7 @@ on_demand_config_mapper = {
     "strings": processing_cfg,
     "floss": integrations_cfg,
     "virustotal": integrations_cfg,
+    "static_shellcode_check": processing_cfg,
 }
 
 
@@ -3962,6 +4032,9 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
 
     if service in CUSTOM_SERVICES:
         pass
+    elif service == "kesakode":
+        if not HAVE_KESAKODE_ONDEMAND:
+            return render(request, "error.html", {"error": "kesakode on demand is disabled in configuration"})
     elif service in on_demand_config_mapper:
         config_section = getattr(on_demand_config_mapper[service], service, {})
         if not config_section.get("on_demand"):
@@ -3985,6 +4058,11 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
             extractedfile = False
             if category in ("static", "target.file"):
                 path = os.path.join(ANALYSIS_BASE_PATH, "analyses", task_id, "binary")
+                if not path_exists(path):
+                    task_obj = db.view_task(task_id)
+                    task_sha256 = getattr(getattr(task_obj, "sample", None), "sha256", None) if task_obj else None
+                    if task_sha256 and task_sha256 == sha256:
+                        path = os.path.join(CUCKOO_ROOT, "storage", "binaries", sha256)
                 category = "target.file"
             elif category == "dropped":
                 path = os.path.join(ANALYSIS_BASE_PATH, "analyses", task_id, "files", sha256)
@@ -4011,6 +4089,44 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
             if not details:
                 details = {"msg": "No results"}
 
+        elif service == "kesakode" and HAVE_KESAKODE_ONDEMAND:
+            # Deferred online Kesakode lookup for a single chosen artifact.
+            try:
+                from lib.cuckoo.common.integrations.malcat.client import MalcatBridgeError, MalcatClient
+                from lib.cuckoo.common.integrations.malcat.convert import kesakode_to_similarity_rows
+                from lib.cuckoo.common.integrations.similarity.base import _as_bool
+
+                scfg = dict(integrations_cfg.get("similarity"))
+                client = MalcatClient(
+                    host=scfg.get("kesakode_host") or "http://127.0.0.1:8090",
+                    api_key=scfg.get("kesakode_apikey") or "",
+                    ssl_verify=_as_bool(scfg.get("kesakode_ssl_verify", True)),
+                    timeout=int(scfg.get("timeout", 120) or 120),
+                )
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                payload = client.analyze(
+                    data=data, features=["kesakode"], kesakode_mode="online",
+                    quota_reserve=int(scfg.get("kesakode_quota_reserve", 10) or 0),
+                )
+                kk = (payload.get("features") or {}).get("kesakode") or {}
+                if kk.get("error"):
+                    details = {"msg": kk["error"]}
+                else:
+                    rows = kesakode_to_similarity_rows(
+                        kk,
+                        minimum_similarity=float(scfg.get("minimum_similarity", 0) or 0),
+                        max_results=int(scfg.get("max_results", 0) or 0),
+                        options=scfg,
+                    )
+                    # 'details' carries the rows; the storage block merges them
+                    # into the artifact's code_similarity_matches (see below).
+                    details = {"code_similarity_matches": rows} if rows else {"msg": "No results"}
+            except MalcatBridgeError as err:
+                details = {"msg": f"Kesakode bridge error: {err}"}
+            except Exception as err:
+                details = {"msg": f"Kesakode on-demand failed: {err}"}
+
         elif service == "vba2graph" and HAVE_VBA2GRAPH:
             vba2graph_func(path, task_id, sha256, on_demand=True)
 
@@ -4018,6 +4134,21 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
             details = extract_strings(path, on_demand=True)
             if not details:
                 details = {"strings": "No strings extracted"}
+
+        elif service == "static_shellcode_check" and HAVE_SHELLCODE_CHECK:
+            sc_kwargs = _shellcode_on_demand_kwargs(task_id, category, sha256)
+            if sc_kwargs is None:
+                return render(
+                    request,
+                    "error.html",
+                    {"error": "Shellcode analysis is only offered for CAPE shellcode payloads and shellcode package submissions"},
+                    status=400,
+                )
+            details = run_shellcode_on_demand(
+                path,
+                sc_kwargs,
+                max_scan=int(processing_cfg.static_shellcode_check.get("shellcode_depth", 262144) or 262144),
+            )
 
         elif service == "virustotal" and HAVE_VIRUSTOTAL:
             details = vt_lookup("file", sha256, on_demand=True)
@@ -4039,13 +4170,9 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
             if not path_exists(bingraph_path):
                 path_mkdir(bingraph_path)
             try:
-                bingraph_args_dict.update({"prefix": sha256, "files": [path], "save_dir": bingraph_path})
-                try:
-                    bingraph_gen(bingraph_args_dict)
-                except Exception as e:
-                    print(f"Can't generate bingraph for {sha256}: {e}")
+                bingraph_gen({**bingraph_args_dict, "prefix": sha256, "files": [path], "save_dir": bingraph_path})
             except Exception as e:
-                print("Bingraph on demand error:", e)
+                print(f"Can't generate bingraph for {sha256}: {e}")
 
         elif service == "floss" and HAVE_FLOSS:
             package = get_task_package(task_id)
@@ -4068,36 +4195,151 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
                     return True
         return False
 
+    def _merge_kesakode_rows(node, target_sha256, new_rows):
+        """Merge on-demand Kesakode rows into an artifact's
+        code_similarity_matches, preserving other engines' rows (e.g. MCRIT) and
+        replacing any prior Kesakode rows so re-clicks don't duplicate."""
+        if isinstance(node, dict):
+            if node.get("sha256") == target_sha256:
+                existing = [r for r in (node.get("code_similarity_matches") or [])
+                            if isinstance(r, dict) and r.get("engine") != "malcat kesakode"]
+                node["code_similarity_matches"] = existing + list(new_rows)
+                node["kesakode"] = {"status": "done"}
+                return True
+            for value in node.values():
+                if isinstance(value, (dict, list)) and _merge_kesakode_rows(value, target_sha256, new_rows):
+                    return True
+            return False
+        if isinstance(node, list):
+            for item in node:
+                if _merge_kesakode_rows(item, target_sha256, new_rows):
+                    return True
+        return False
+
+    def _update_similarity_summary(sim_block, target_sha256, new_rows, error_msg=None):
+        """Keep top-level report['similarity'] in sync after an on-demand Kesakode lookup."""
+        if not isinstance(sim_block, dict):
+            return None
+        results_map = sim_block.setdefault("results", {})
+        kk_rows = results_map.get("malcat kesakode")
+        if isinstance(kk_rows, list):
+            for entry in kk_rows:
+                if isinstance(entry, dict) and entry.get("sha256") == target_sha256:
+                    if error_msg:
+                        entry["status"] = "error"
+                        entry["error"] = str(error_msg)
+                        entry["matches"] = []
+                    elif new_rows:
+                        entry["status"] = "ok"
+                        entry.pop("error", None)
+                        entry["matches"] = [
+                            {k: v for k, v in r.items() if k != "engine"} for r in new_rows
+                        ]
+                    else:
+                        entry["status"] = "no_match"
+                        entry.pop("error", None)
+                        entry["matches"] = []
+        by_sha = sim_block.setdefault("by_sha256", {})
+        if new_rows:
+            existing = [
+                r for r in (by_sha.get(target_sha256) or [])
+                if isinstance(r, dict) and r.get("engine") != "malcat kesakode"
+            ]
+            by_sha[target_sha256] = existing + list(new_rows)
+        elif target_sha256 in by_sha:
+            remaining = [
+                r for r in (by_sha.get(target_sha256) or [])
+                if isinstance(r, dict) and r.get("engine") != "malcat kesakode"
+            ]
+            if remaining:
+                by_sha[target_sha256] = remaining
+            else:
+                by_sha.pop(target_sha256, None)
+        return sim_block
+
+    # Kesakode on-demand stores into code_similarity_matches (merge), not a
+    # 'kesakode' key, so it renders in the existing Code Similarity row.
+    kesakode_rows = None
+    if service == "kesakode" and isinstance(details, dict) and "code_similarity_matches" in details:
+        kesakode_rows = details["code_similarity_matches"]
+
     if details is not False:
         # Use no_hooks=True to avoid running heavy hooks just to get the _id for update
-        buf = mongo_find_one("analysis", {"info.id": int(task_id)}, {"_id": 1, category: 1}, no_hooks=True)
+        projection = {"_id": 1, category: 1}
+        if service == "kesakode":
+            projection["similarity"] = 1
+        buf = (
+            mongo_find_one("analysis", {"info.id": int(task_id)}, projection, no_hooks=True)
+            if enabledconf["mongodb"]
+            else None
+        )
         if not buf:
+            task = db.view_task(task_id)
+            task_sha256 = getattr(getattr(task, "sample", None), "sha256", None) if task else None
+            if task and category == "target.file" and task_sha256 == sha256:
+                from submission.static_preview import get_static_preview, update_static_preview_service
+
+                if service == "kesakode" and kesakode_rows is not None:
+                    update_static_preview_service(sha256, "code_similarity_matches", kesakode_rows)
+                    update_static_preview_service(sha256, "kesakode", {"status": "done"})
+                else:
+                    update_static_preview_service(sha256, service, details)
+                if request.headers.get("HX-Request"):
+                    preview = dict(get_static_preview(task, run_full=False) or {})
+                    preview["expand_service"] = service
+                    return render(request, "analysis/generic/_file_info.html", preview)
+                return redirect("submission_status", task_id=task_id)
             return render(request, "error.html", {"error": f"Task {task_id} not found in results database"})
 
         servicedata = {}
         if category == "CAPE":
-            _set_service_by_sha256(buf.get(category, {}).get("payloads", []) or [], sha256, service, details)
+            if kesakode_rows is not None:
+                _merge_kesakode_rows(buf.get(category, {}).get("payloads", []) or [], sha256, kesakode_rows)
+            else:
+                _set_service_by_sha256(buf.get(category, {}).get("payloads", []) or [], sha256, service, details)
             servicedata = buf.get(category)
         elif category in ("procdump", "procmemory", "dropped"):
-            _set_service_by_sha256(buf.get(category) or [], sha256, service, details)
+            if kesakode_rows is not None:
+                _merge_kesakode_rows(buf.get(category) or [], sha256, kesakode_rows)
+            else:
+                _set_service_by_sha256(buf.get(category) or [], sha256, service, details)
             servicedata = buf.get(category)
         elif category == "target.file":
             servicedata = buf.get("target", {}).get("file", {})
             if servicedata:
                 if service == "xlsdeobf":
-                    servicedata.setdefault("office", {}).setdefault("XLMMacroDeobfuscator", details)
+                    servicedata.setdefault("office", {})["XLMMacroDeobfuscator"] = details
+                elif service == "kesakode" and kesakode_rows is not None:
+                    if extractedfile:
+                        _merge_kesakode_rows(servicedata, sha256, kesakode_rows)
+                    else:
+                        existing = [r for r in (servicedata.get("code_similarity_matches") or [])
+                                    if isinstance(r, dict) and r.get("engine") != "malcat kesakode"]
+                        servicedata["code_similarity_matches"] = existing + list(kesakode_rows)
+                        servicedata["kesakode"] = {"status": "done"}
                 elif extractedfile:
                     _set_service_by_sha256(servicedata, sha256, service, details)
                 else:
-                    servicedata.setdefault(service, details)
+                    servicedata[service] = details
         elif service in CUSTOM_SERVICES:
             servicedata = details
             category = service
 
         # Always try to save if details were found (even if empty) to mark the task as done
         if servicedata is not None:
+            update_doc = {category: servicedata}
+            if service == "kesakode" and isinstance(buf.get("similarity"), dict):
+                err_msg = details.get("msg") if isinstance(details, dict) and kesakode_rows is None and details.get("msg") != "No results" else None
+                updated_sim = _update_similarity_summary(
+                    buf["similarity"],
+                    sha256,
+                    kesakode_rows or [],
+                    error_msg=err_msg,
+                )
+                if updated_sim is not None:
+                    update_doc["similarity"] = updated_sim
             try:
-                mongo_update_one("analysis", {"_id": ObjectId(buf["_id"])}, {"$set": {category: servicedata}})
+                mongo_update_one("analysis", {"_id": ObjectId(buf["_id"])}, {"$set": update_doc})
             except MONGO_DOCUMENT_TOO_LARGE_ERRORS:
                 return render(
                     request,
@@ -4120,8 +4362,16 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
         del details
 
     if request.headers.get("HX-Request"):
-        report = mongo_find_one("analysis", {"info.id": int(task_id)})
+        report = mongo_find_one("analysis", {"info.id": int(task_id)}) if enabledconf["mongodb"] else None
         if not report:
+            task = db.view_task(task_id)
+            task_sha256 = getattr(getattr(task, "sample", None), "sha256", None) if task else None
+            if task and task_sha256 == sha256:
+                from submission.static_preview import get_static_preview
+
+                preview = dict(get_static_preview(task, run_full=False) or {})
+                preview["expand_service"] = service
+                return render(request, "analysis/generic/_file_info.html", preview)
             return HttpResponse("Analysis not found", status=404)
 
         def _get_file_by_sha256(node, target_sha256):
@@ -4170,6 +4420,7 @@ def on_demand(request, service: str, task_id: str, category: str, sha256):
             "on_demand": on_demand_conf,
             "graphs": graphs,
             "analysis": report,
+            "expand_service": service,
         }
         return render(request, "analysis/generic/_file_info.html", context)
 
@@ -4286,7 +4537,7 @@ def hunt(request):
     if days_back > 0:
         import datetime
         delta = datetime.timedelta(days=days_back)
-        start_date = (datetime.datetime.utcnow() - delta).strftime("%Y-%m-%d %H:%M:%S")
+        start_date = (datetime.datetime.now(datetime.timezone.utc) - delta).strftime("%Y-%m-%d %H:%M:%S")
         match_query["info.started"] = {"$gte": start_date}
 
     # Dynamic multi-category aggregation
@@ -4365,18 +4616,18 @@ def tag_tasks(request):
     from lib.cuckoo.core.data.task import Task
     updated_count = 0
     try:
-        for tid in task_ids:
-            task = db.session.get(Task, int(tid))
-            if task:
-                existing_tags = task.tags_tasks or ""
-                current_tags = [t.strip() for t in existing_tags.split(",") if t.strip()]
-                if tag not in current_tags:
-                    current_tags.append(tag)
-                    task.tags_tasks = ",".join(current_tags)
-                    updated_count += 1
-        db.session.commit()
+        # Nested in the request transaction: any failure rolls back every tag update.
+        with db.transaction():
+            for tid in task_ids:
+                task = db.session.get(Task, int(tid))
+                if task:
+                    existing_tags = task.tags_tasks or ""
+                    current_tags = [t.strip() for t in existing_tags.split(",") if t.strip()]
+                    if tag not in current_tags:
+                        current_tags.append(tag)
+                        task.tags_tasks = ",".join(current_tags)
+                        updated_count += 1
     except Exception as e:
-        db.session.rollback()
         return JsonResponse({"status": "error", "message": f"Database update failed: {e}"}, status=500)
 
     return JsonResponse({"status": "success", "updated_count": updated_count, "tag": tag})

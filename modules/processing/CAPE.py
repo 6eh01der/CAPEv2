@@ -13,6 +13,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import collections
+import copy
 import hashlib
 import json
 import logging
@@ -25,6 +26,11 @@ from lib.cuckoo.common.abstracts import Processing
 from lib.cuckoo.common.cape_utils import cape_name_from_yara, is_duplicated_binary, pe_map, static_config_parsers
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.common.integrations.file_extra_info import DuplicatesType, static_file_info
+from lib.cuckoo.common.integrations.shellcode_utils import (
+    SHELLCODE_CODE_MAPPING,
+    extract_shellcode_payloads,
+    process_file_shellcode,
+)
 from lib.cuckoo.common.objects import File
 from lib.cuckoo.common.path_utils import path_exists
 from lib.cuckoo.common.replace_patterns_utils import _clean_path
@@ -32,6 +38,7 @@ from lib.cuckoo.common.utils import (
     add_family_detection,
     convert_to_printable_and_truncate,
     get_clamav_consensus,
+    get_files_storage_path,
     get_options,
     make_bytes,
     texttypes,
@@ -42,6 +49,7 @@ from dev_utils.mongodb import mongo_find_one
 processing_conf = Config("processing")
 integrations_conf = Config("integrations")
 externalservices_conf = Config("externalservices")
+reporting_conf = Config("reporting")
 
 HAVE_VIRUSTOTAL = False
 if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_demand:
@@ -70,6 +78,8 @@ code_mapping = {
     0x1000: "Unpacked PE Image",
     0x6A: "AMSI Buffer",
     0x6B: "AMSI Stream",
+    # recovered statically by static_shellcode_check from a shellcode payload
+    **SHELLCODE_CODE_MAPPING,
 }
 
 inject_map = {
@@ -193,26 +203,36 @@ class CAPE(Processing):
         cached = False
         pefile_object = None
         run_static = True
+        preview_configs_by_name = {}
 
         # Calculate options hash to prevent poisoning
         opts = get_options(self.task.get("options", ""))
         sorted_opts = json.dumps(opts, sort_keys=True)
         options_hash = hashlib.sha256(sorted_opts.encode()).hexdigest()
 
-        if processing_conf.CAPE.file_cache:
+        if processing_conf.CAPE.file_cache or (reporting_conf.mongodb.enabled and category in ("static", "file")):
             try:
                 db_file = mongo_find_one("files", {"sha256": sha256})
-                if db_file:
+                if db_file and (
+                    processing_conf.CAPE.file_cache
+                    or self.task.get("id") in db_file.get("_task_ids", [])
+                    or bool(db_file.get("static_preview_enriched"))
+                ):
+                    for cfg in db_file.get("static_preview_malware_conf") or []:
+                        if isinstance(cfg, dict):
+                            for k, v in cfg.items():
+                                if k != "_associated_config_hashes" and isinstance(v, dict):
+                                    preview_configs_by_name[k] = v
                     # Security Fix: Update path immediately
                     db_file["path"] = file_path
-                    if "_id" in db_file:
-                        del db_file["_id"]
+                    for internal_key in ("_id", "_task_ids", "static_preview_malware_conf", "static_preview_enriched"):
+                        db_file.pop(internal_key, None)
 
                     yara_match = db_file.get("yara_hash", "") == File.yara_rules_hash
                     options_match = db_file.get("options_hash", "") == options_hash
                     file_info = db_file
                     cached = True
-                    if yara_match and options_match:
+                    if processing_conf.CAPE.file_cache and yara_match and options_match:
                         run_static = False
                         if HAVE_VIRUSTOTAL:
                             # We might want to refresh VT based on cache policy
@@ -289,6 +309,10 @@ class CAPE(Processing):
             )
 
         type_string, append_file = self._metadata_processing(metadata, file_info, append_file)
+        if metadata.get("extracted_from"):
+            file_info["extracted_from"] = metadata["extracted_from"]
+        else:
+            file_info.pop("extracted_from", None)
 
         if category in ("static", "file"):
             if MISP_HASH_LOOKUP:
@@ -359,7 +383,19 @@ class CAPE(Processing):
                 if file.get("data", b""):
                     extracted_file_data = make_bytes(file["data"])
                 else:
-                    extracted_file_data = Path(file["path"]).read_bytes()
+                    extracted_path = file.get("path", "")
+                    if not (extracted_path and path_exists(extracted_path)) and file.get("sha256"):
+                        candidate = os.path.join(self.self_extracted, file["sha256"]) if self.self_extracted else ""
+                        if candidate and path_exists(candidate):
+                            extracted_path = candidate
+                        else:
+                            with suppress(ValueError):
+                                storage_candidate = get_files_storage_path(file["sha256"])
+                                if path_exists(storage_candidate):
+                                    extracted_path = storage_candidate
+                    if not (extracted_path and path_exists(extracted_path)):
+                        continue
+                    extracted_file_data = Path(extracted_path).read_bytes()
                 for yara in file["cape_yara"]:
                     all_files.append(
                         (
@@ -392,7 +428,10 @@ class CAPE(Processing):
                 append_file = self._cape_type_string(type_strings, file_info, append_file)
 
             if cape_name and cape_name not in executed_config_parsers[tmp_path]:
-                tmp_config = static_config_parsers(cape_name, tmp_path, tmp_data)
+                if tmp_path == file_info["path"] and cape_name in preview_configs_by_name:
+                    tmp_config = {cape_name: copy.deepcopy(preview_configs_by_name[cape_name])}
+                else:
+                    tmp_config = static_config_parsers(cape_name, tmp_path, tmp_data)
                 self.update_cape_configs(cape_name, tmp_config, file_info)
                 executed_config_parsers[tmp_path].add(cape_name)
 
@@ -407,6 +446,17 @@ class CAPE(Processing):
                     cape_names.add(cape_name)
                     log.debug("CAPE: config returned for: %s", cape_name)
                     self.update_cape_configs(cape_name, tmp_config, file_info)
+
+        shellcode_payloads = process_file_shellcode(
+            file_info,
+            file_data,
+            category=category,
+            task=self.task,
+            opts=opts,
+            results=self.results,
+            detect2pid=self.detect2pid,
+            add_statistic=self.add_statistic_tmp,
+        )
 
         self.link_configs_to_analysis()
         self.add_family_detections(file_info, cape_names)
@@ -426,6 +476,20 @@ class CAPE(Processing):
                 self.add_statistic_tmp("flare_capa", "time", pretime=pretime)
             self.cape["payloads"].append(file_info)
 
+        if shellcode_payloads:
+            deferred = getattr(self, "_deferred_shellcode_payloads", None)
+            if deferred is not None:
+                deferred.append((file_info, shellcode_payloads))
+            else:
+                extract_shellcode_payloads(
+                    file_info,
+                    shellcode_payloads,
+                    self_extracted_dir=self.self_extracted,
+                    process_file_cb=lambda path, append, meta: self.process_file(
+                        path, append, meta, category="CAPE", duplicated=duplicated
+                    ),
+                )
+
     def _set_dict_keys(self):
         self.cape = {"payloads": [], "configs": []}
 
@@ -434,6 +498,7 @@ class CAPE(Processing):
         @return: list of CAPE output files with related information.
         """
         self._set_dict_keys()
+        self._deferred_shellcode_payloads = []
         meta = {}
         # Required to control files extracted by integrations.conf as we store them in dropped
         duplicated: DuplicatesType = collections.defaultdict(set)
@@ -544,6 +609,16 @@ class CAPE(Processing):
                             # We set append_file to False as we don't wan't to include
                             # the files by default in the CAPE tab
                             self.process_file(filepath, False, meta.get(filepath, {}), category=category, duplicated=duplicated)
+        deferred, self._deferred_shellcode_payloads = self._deferred_shellcode_payloads, None
+        for parent_info, payloads in deferred:
+            extract_shellcode_payloads(
+                parent_info,
+                payloads,
+                self_extracted_dir=self.self_extracted,
+                process_file_cb=lambda path, append, meta: self.process_file(
+                    path, append, meta, category="CAPE", duplicated=duplicated
+                ),
+            )
         return self.cape
 
     def update_cape_configs(self, cape_name, config, file_obj):

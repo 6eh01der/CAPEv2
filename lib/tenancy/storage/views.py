@@ -16,51 +16,9 @@ from django.shortcuts import render
 log = logging.getLogger(__name__)
 
 
-def central_job_id_for_task(task_id: Any) -> Optional[str]:
-    """Resolve the broker `job_id` for a task from its SQL `custom` field."""
-    try:
-        tid = int(task_id)
-    except (TypeError, ValueError):
-        return None
-    try:
-        from analysis.views import db
-        from lib.tenancy.storage.artifact_storage import job_id_from_custom
-
-        t = db.view_task(tid)
-        return job_id_from_custom(getattr(t, "custom", None) if t else None)
-    except Exception:
-        log.exception("central_job_id_for_task: DB lookup failed for task %s; falling back to scoped resolution", tid)
-        return None
-
-
 def central_analysis_query(task_id: Any, scope: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Mongo filter to fetch a task's analysis doc when object storage is enabled."""
-    from lib.tenancy.storage.config import object_storage_bridge_required
-
-    jid = central_job_id_for_task(task_id)
-    if jid:
-        q: dict[str, Any] = {"info.job_id": jid}
-        if scope:
-            try:
-                if object_storage_bridge_required():
-                    _own_unstamped = {
-                        "$and": [{"info.job_id": jid}, {"info.tenant_id": None}, {"info.id": int(task_id)}]
-                    }
-                else:
-                    _own_unstamped = {"$and": [{"info.tenant_id": None}, {"info.id": int(task_id)}]}
-                q = {"$and": [q, {"$or": [scope, _own_unstamped]}]}
-            except (TypeError, ValueError):
-                q = {"$and": [q, scope]}
-        return q
-
-    if scope is not None and object_storage_bridge_required():
-        try:
-            tid = int(task_id)
-            return {"$and": [{"info.id": tid}, {"info.job_id": f"ui-{tid}"}, scope]}
-        except (TypeError, ValueError):
-            return {"info.job_id": {"$in": []}}
-
-    q = {"info.id": int(task_id)}
+    q: dict[str, Any] = {"info.id": int(task_id)}
     if scope:
         q = {"$and": [q, scope]}
     return q
@@ -286,6 +244,11 @@ def central_file(request: Any, category: str, task_id: Any, dlfile: str) -> Any:
     try:
         return artifact_response(task_id, relpath, cd, f"{task_id}_{fn}", scope=scope)
     except Http404:
+        if category == "dropped" or (category.startswith("CAPE") and category not in zip_categories):
+            try:
+                return artifact_response(task_id, f"selfextracted/{dlfile}", cd, f"{task_id}_{fn}", scope=scope)
+            except Http404:
+                pass
         return render(request, "error.html", {"error": f"Could not find {category} {dlfile}"})
 
 
@@ -298,6 +261,7 @@ def central_open_procdump(
     import zipfile
 
     from django.conf import settings
+    from lib.cuckoo.common.utils import get_cape_external_dir
     from lib.tenancy.storage.artifact_storage import materialize_artifact
     from lib.tenancy.storage.scope import viewer_scope
 
@@ -309,7 +273,8 @@ def central_open_procdump(
     zpath, zt = materialize_artifact(task_id, f"memory/{origname}.zip", scope=scope)
     if not zpath:
         return None, None, None
-    tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=settings.TEMP_PATH)
+    ext_dir = get_cape_external_dir(tmppath=getattr(settings, "TEMP_PATH", None))
+    tmpdir = tempfile.mkdtemp(prefix="capeprocdump_", dir=ext_dir)
     try:
         with zipfile.ZipFile(zpath, "r") as f:
             extracted = f.extract(origname, path=tmpdir)
@@ -355,6 +320,8 @@ def central_vtupload(request: Any, category: str, task_id: Any, filename: str, d
 
     scope = viewer_scope(request.user)
     path, is_temp = materialize_artifact(task_id, relpath, scope=scope)
+    if not path and category in ("dropped", "CAPE"):
+        path, is_temp = materialize_artifact(task_id, f"selfextracted/{filename}", scope=scope)
     if not path:
         return render(request, "error.html", {"error": "File not found"})
     try:

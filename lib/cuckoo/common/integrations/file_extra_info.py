@@ -9,6 +9,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
+import timeit
 
 # from contextlib import suppress
 from typing import Any, DefaultDict, List, Optional, Set
@@ -20,6 +22,7 @@ from lib.cuckoo.common.constants import CUCKOO_ROOT
 from lib.cuckoo.common.integrations.file_extra_info_modules import (
     ExtractorReturnType,
     SuccessfulExtractionReturnType,
+    _collision_safe_destination,
     collect_extracted_filenames,
     extractor_ctx,
     time_tracker,
@@ -45,7 +48,7 @@ from lib.cuckoo.common.path_utils import (
     path_read_file,
     path_write_file,
 )
-from lib.cuckoo.common.utils import get_options, is_text_file
+from lib.cuckoo.common.utils import deduplicate_file_to_storage, get_options, is_text_file, sanitize_filename
 
 try:
     from sflock import unpack
@@ -80,6 +83,12 @@ if integration_conf.flare_capa.enabled and not integration_conf.flare_capa.on_de
 HAVE_FLOSS = False
 if integration_conf.floss.enabled and not integration_conf.floss.on_demand:
     from lib.cuckoo.common.integrations.floss import HAVE_FLOSS, Floss
+
+HAVE_MALCAT = False
+if getattr(integration_conf, "malcat", None) and integration_conf.malcat.get("enabled", False):
+    from lib.cuckoo.common.integrations.malcat.capa import malcat_details
+
+    HAVE_MALCAT = True
 
 from lib.cuckoo.common.integrations.magika import magika_info
 
@@ -149,6 +158,50 @@ if processing_conf.virustotal.enabled and not processing_conf.virustotal.on_dema
 exclude_startswith = ("parti_",)
 excluded_extensions = (".parti",)
 tools_folder = os.path.join(cfg.cuckoo.get("tmppath", "/tmp"), "cape-external")
+_OFFICE_EXTENSIONS = (
+    ".doc",
+    ".docx",
+    ".docm",
+    ".dot",
+    ".dotm",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+    ".xlsm",
+    ".xlsb",
+    ".ppt",
+    ".pptx",
+    ".pptm",
+    ".ppsm",
+    ".pub",
+)
+
+
+_OFFICE_TYPE_MARKERS = (
+    "Rich Text Format",
+    "Microsoft Word",
+    "Microsoft Excel",
+    "Microsoft PowerPoint",
+    "Microsoft OOXML",
+    "Microsoft Office Word",
+    "Microsoft Office Excel",
+    "Microsoft Office PowerPoint",
+)
+
+
+def _is_office_target(file_path: str, data_dictionary: dict, package: str) -> bool:
+    file_name = data_dictionary.get("name", "")
+    if isinstance(file_name, list):
+        file_name = file_name[0] if file_name else ""
+    elif not isinstance(file_name, str):
+        file_name = ""
+    file_type = data_dictionary.get("type", "") or ""
+    return (
+        package in {"doc", "ppt", "xls", "pub"}
+        or file_name.lower().endswith(_OFFICE_EXTENSIONS)
+        or file_path.lower().endswith(_OFFICE_EXTENSIONS)
+        or any(marker in file_type for marker in _OFFICE_TYPE_MARKERS)
+    )
 
 
 def static_file_info(
@@ -181,6 +234,11 @@ def static_file_info(
     if "MSI Installer" in data_dictionary.get("type", "") and "msi" not in data_dictionary:
         data_dictionary["msi"] = parse_msi(file_path)
 
+    if HAVE_MALCAT and "malcat" not in data_dictionary:
+        malcat_info = malcat_details(file_path, category=category, file_type=data_dictionary.get("type", ""))
+        if malcat_info:
+            data_dictionary["malcat"] = malcat_info
+
     # ToDo we need type checking as it wont work for most of static jobs
     if HAVE_PEFILE and ("PE32" in data_dictionary.get("type", "") or "MS-DOS executable" in data_dictionary.get("type", "")):
         if "pe" not in data_dictionary:
@@ -206,10 +264,37 @@ def static_file_info(
                     if dotnet_strings:
                         data_dictionary.setdefault("dotnet_strings", dotnet_strings)
 
-    elif (HAVE_OLETOOLS and package in {"doc", "ppt", "xls", "pub"} and integration_conf.general.office) or data_dictionary.get("name", "").endswith((".doc", ".ppt", ".xls", ".pub")):
+    elif HAVE_OLETOOLS and integration_conf.general.office and _is_office_target(file_path, data_dictionary, package):
         if "office" not in data_dictionary:
+            time_start = timeit.default_timer()
             # options is dict where we need to get pass get_options
-            data_dictionary["office"] = Office(file_path, task_id, data_dictionary["sha256"], options_dict).run()
+            office_parser = Office(file_path, task_id, data_dictionary.get("sha256", ""), options_dict)
+            data_dictionary["office"] = office_parser.run()
+            if office_parser.extracted_files and destination_folder:
+                path_mkdir(tools_folder, exist_ok=True)
+                if not path_exists(destination_folder):
+                    path_mkdir(destination_folder, exist_ok=True)
+                tempdir = tempfile.mkdtemp(prefix="office_", dir=tools_folder)
+                try:
+                    written_names = []
+                    for orig_name, payload in office_parser.extracted_files:
+                        raw_name = os.path.basename((orig_name or "").replace("\\", "/").strip())
+                        safe_name = sanitize_filename(raw_name) if raw_name else "extracted.bin"
+                        if safe_name in {"", ".", ".."} or all(c == "." for c in safe_name):
+                            safe_name = "extracted.bin"
+                        dest_path = _collision_safe_destination("", os.path.join(tempdir, safe_name))
+                        _ = path_write_file(dest_path, payload)
+                        written_names.append(os.path.basename(dest_path))
+                    if written_names:
+                        metadata = _extracted_files_metadata(tempdir, destination_folder, files=written_names, results=results)
+                        if metadata:
+                            data_dictionary.setdefault("selfextract", {})["Office"] = {
+                                "extracted_files": metadata,
+                                "extracted_files_time": timeit.default_timer() - time_start,
+                                "password": options_dict.get("password", ""),
+                            }
+                finally:
+                    shutil.rmtree(tempdir, ignore_errors=True)
     elif ("PDF" in data_dictionary.get("type", "") or file_path.endswith(".pdf")) and integration_conf.general.pdf:
         if "pdf" not in data_dictionary:
             data_dictionary["pdf"] = PDF(file_path).run()
@@ -400,17 +485,19 @@ def _extracted_files_metadata(
             file_info["path"] = dest_path
             file_info["guest_paths"] = [file_info["name"]]
             file_info["name"] = os.path.basename(dest_path)
-            if not path_exists(dest_path):
-                shutil.move(full_path, dest_path)
+            dest_existed = path_exists(dest_path)
+            deduplicate_file_to_storage(full_path, file_info["sha256"], dest_path)
+            if not dest_existed:
+                folder_name = os.path.basename(os.path.normpath(destination_folder)) or "selfextracted"
                 print(
                     json.dumps(
                         {
-                            "path": os.path.join("files", file_info["sha256"]),
+                            "path": os.path.join(folder_name, file_info["sha256"]),
                             "filepath": file_info["name"],
                             "pids": [],
                             "ppids": [],
                             "metadata": "",
-                            "category": "files",
+                            "category": folder_name,
                         },
                         ensure_ascii=False,
                     ),
@@ -507,6 +594,18 @@ def _is_extractor_pool_healthy(pool):
     return is_pool_healthy(pool)
 
 
+def _init_extractor_worker():
+    """Tag nested extractor pool children so ps/htop does not mistake them for
+    top-level utils/process.py [Task N] workers."""
+    try:
+        from setproctitle import getproctitle, setproctitle
+
+        base_title = getproctitle().split(" [", 1)[0]
+        setproctitle(f"{base_title} [extractor]")
+    except Exception:
+        pass
+
+
 def _new_extractor_pool(max_workers=None):
     """Create a fresh fork-context pebble pool. Fork (not forkserver/spawn) is
     deliberate: the task child is single-threaded when the pool is created, so
@@ -515,7 +614,7 @@ def _new_extractor_pool(max_workers=None):
     ctx = multiprocessing.get_context("fork")
     configured = int(integration_conf.general.max_workers)
     workers = max(1, min(configured, int(max_workers))) if max_workers else configured
-    return pebble.ProcessPool(max_workers=workers, context=ctx)
+    return pebble.ProcessPool(max_workers=workers, initializer=_init_extractor_worker, context=ctx)
 
 
 def _create_extractor_pool(max_workers=None):
@@ -776,17 +875,23 @@ def vbe_extract(file: str, **_) -> ExtractorReturnType:
 
 @time_tracker
 def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorReturnType:
-    if file.endswith("_Slayed"):
+    """Deprecated: .NET Reactor deobfuscation is handled by de4dotEx under de4dot_deobfuscate."""
+    if file.endswith("_Slayed") or os.path.splitext(file)[0].endswith("_Slayed"):
         return
 
     if all(".NET Reactor" not in string for string in data_dictionary.get("die", [])):
         return
 
-    binary = shlex.split(integration_conf.eziriz_deobfuscate.binary.strip())[0]
-    binary = os.path.join(CUCKOO_ROOT, binary)
-    if not binary:
+    eziriz_conf = integration_conf.eziriz_deobfuscate or {}
+    raw_binary = (eziriz_conf.get("binary") or "").strip()
+    if not raw_binary:
         log.warning("eziriz_deobfuscate.binary is not defined in the configuration.")
         return
+    binary_parts = shlex.split(raw_binary)
+    if not binary_parts:
+        log.warning("eziriz_deobfuscate.binary is not defined in the configuration.")
+        return
+    binary = os.path.join(CUCKOO_ROOT, binary_parts[0])
 
     if not path_exists(binary):
         log.error(
@@ -802,19 +907,61 @@ def eziriz_deobfuscate(file: str, *, data_dictionary: dict, **_) -> ExtractorRet
     with extractor_ctx(file, "eziriz", prefix="eziriz_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = run_tool(
-            [
-                os.path.join(CUCKOO_ROOT, binary),
-                *shlex.split(integration_conf.eziriz_deobfuscate.extra_args.strip()),
-                file,
-            ],
-            universal_newlines=True,
-            stderr=subprocess.PIPE,
-        )
-        deobf_file = file + "_Slayed"
-        if path_exists(deobf_file):
-            shutil.move(deobf_file, dest_path)
-            ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        work_dir = os.path.join(tempdir, "_work")
+        path_mkdir(work_dir, exist_ok=True)
+        staged_name = os.path.basename(file)
+        staged_file = os.path.join(work_dir, staged_name)
+        shutil.copy2(file, staged_file)
+
+        extra_args = shlex.split((eziriz_conf.get("extra_args") or "").strip())
+        if "--no-pause" not in {arg.lower().split("=", 1)[0] for arg in extra_args}:
+            extra_args = ["--no-pause", "True", *extra_args]
+
+        output = ""
+        try:
+            output = run_tool(
+                [binary, *extra_args, staged_file],
+                universal_newlines=True,
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            staged_stem, staged_ext = os.path.splitext(staged_file)
+            slayed_candidates = [f"{staged_stem}_Slayed{staged_ext}", f"{staged_file}_Slayed"]
+            for candidate in slayed_candidates:
+                if path_exists(candidate):
+                    shutil.move(candidate, dest_path)
+                    break
+
+            for entry in os.listdir(work_dir):
+                if entry in (staged_name, "PEImage.tmp"):
+                    continue
+                clean_name = entry.replace("\\", "/").rsplit("/", 1)[-1]
+                if not clean_name or clean_name in (".", "..", "PEImage.tmp"):
+                    continue
+                src = os.path.join(work_dir, entry)
+                if not path_is_file(src):
+                    continue
+                target = _collision_safe_destination(src, os.path.join(tempdir, clean_name))
+                shutil.move(src, target)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        for entry in list(os.listdir(tempdir)):
+            if "\\" not in entry:
+                continue
+            src = os.path.join(tempdir, entry)
+            clean_name = entry.rsplit("\\", 1)[-1]
+            if clean_name in ("", ".", "..", "PEImage.tmp"):
+                if path_is_file(src):
+                    os.unlink(src)
+                continue
+            if path_is_file(src):
+                target = _collision_safe_destination(src, os.path.join(tempdir, clean_name))
+                shutil.move(src, target)
+
+        ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        if not ctx.get("extracted_files") and output:
+            log.debug("eziriz_deobfuscate produced no output files for %s: %s", file, output.strip())
 
     return ctx
 
@@ -824,30 +971,47 @@ def de4dot_deobfuscate(file: str, *, filetype: str, **_) -> ExtractorReturnType:
     if "Mono" not in filetype:
         return
 
-    binary = shlex.split(integration_conf.de4dot_deobfuscate.binary.strip())[0]
-    if not binary:
+    de4dot_conf = integration_conf.de4dot_deobfuscate or {}
+    raw_binary = (de4dot_conf.get("binary") or "").strip()
+    if not raw_binary:
         log.warning("de4dot_deobfuscate.binary is not defined in the configuration.")
         return
-    if not path_exists(binary):
-        log.error("Missed dependency: sudo apt install de4dot")
+    binary_parts = shlex.split(raw_binary)
+    if not binary_parts:
+        log.warning("de4dot_deobfuscate.binary is not defined in the configuration.")
         return
+    binary = binary_parts[0] if os.path.isabs(binary_parts[0]) else os.path.join(CUCKOO_ROOT, binary_parts[0])
+    if not path_exists(binary):
+        if binary == "/usr/local/bin/de4dot" and path_exists("/usr/bin/de4dot"):
+            binary = "/usr/bin/de4dot"
+        elif binary == "/usr/bin/de4dot" and path_exists("/usr/local/bin/de4dot"):
+            binary = "/usr/local/bin/de4dot"
+
+    if not path_exists(binary):
+        log.error(
+            "Missing dependency: Install de4dotEx from https://github.com/GDATAAdvancedAnalytics/de4dotEx/releases (or sudo apt install de4dot): %s",
+            binary,
+        )
+        return
+
+    if not os.access(binary, os.X_OK):
+        log.error("You need to add execution permissions: chmod a+x %s", binary)
+        return
+
+    extra_args = shlex.split((de4dot_conf.get("extra_args") or "").strip())
 
     with extractor_ctx(file, "de4dot", prefix="de4dot_", folder=tools_folder) as ctx:
         tempdir = ctx["tempdir"]
         dest_path = os.path.join(tempdir, os.path.basename(file))
-        _ = run_tool(
-            [
-                binary,
-                *shlex.split(integration_conf.de4dot_deobfuscate.extra_args.strip()),
-                "-f",
-                file,
-                "-o",
-                dest_path,
-            ],
+        output = run_tool(
+            [binary, *extra_args, "-f", file, "-o", dest_path],
             universal_newlines=True,
-            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
         )
         ctx["extracted_files"] = collect_extracted_filenames(tempdir)
+        if not ctx.get("extracted_files") and output:
+            log.debug("de4dot_deobfuscate produced no output files for %s: %s", file, output.strip())
 
     return ctx
 

@@ -13,10 +13,53 @@ from django.shortcuts import render, redirect
 
 from guac.channels_auth import resolve_session_user
 
+from sqlalchemy import delete, select
+
 from lib.cuckoo.common.config import Config
 from lib.cuckoo.core.database import Database
 
 logger = logging.getLogger("guac-session")
+
+
+# DB helpers. These views can be served by guac-web without DBTransactionMiddleware and
+# also run in background threads, so every DB touch opens its own short (re-entrant)
+# transaction; none is held across libvirt or guest-agent calls.
+def _view_vm_machine(vm_name):
+    with Database().transaction():
+        db_ = Database()
+        return db_.view_machine_by_label(vm_name) or db_.view_machine(vm_name)
+
+
+def _active_task_and_guest(machine_id, vm_name):
+    """Return (running task id or None, whether an unfinished guest exists) for a VM."""
+    from lib.cuckoo.common.constants import TASK_RUNNING
+    from lib.cuckoo.core.data.guests import Guest
+    from lib.cuckoo.core.data.task import Task
+
+    db_ = Database()
+    with db_.transaction():
+        task_id = db_.session.scalar(
+            select(Task.id).where(Task.machine_id == machine_id, Task.status == TASK_RUNNING).limit(1)
+        )
+        guest_id = db_.session.scalar(select(Guest.id).where(Guest.label == vm_name, Guest.shutdown_on.is_(None)).limit(1))
+    return task_id, guest_id is not None
+
+
+def _set_machine_locked(machine, locked):
+    db_ = Database()
+    with db_.transaction():
+        if locked:
+            db_.lock_machine(machine)
+        else:
+            db_.unlock_machine(machine)
+
+
+def _set_machine_snapshot(vm_name, snapshot_name):
+    db_ = Database()
+    with db_.transaction():
+        machine = db_.view_machine_by_label(vm_name)
+        if machine:
+            machine.snapshot = snapshot_name
 
 
 class conditional_login_required:
@@ -76,10 +119,26 @@ def is_vnc_console_enabled():
     return bool(enabled)
 
 
-def _error(request, task_id, msg):
-    return render(request, "guac/error.html", {
-        "error_msg": msg, "error": "remote session", "task_id": task_id,
-    })
+def _error(request, task_id, msg, status=200):
+    return render(
+        request,
+        "guac/error.html",
+        {"error_msg": msg, "error": "remote session", "task_id": task_id},
+        status=status,
+    )
+
+
+def _resolve_guac_viewer(request):
+    from lib.tenancy.middleware import default_viewer_resolver
+
+    viewer = getattr(request, "viewer", None)
+    if viewer is not None:
+        return viewer
+    return default_viewer_resolver(getattr(request, "user", None))
+
+
+def _is_direct_vnc_authorized(request) -> bool:
+    return bool(_resolve_guac_viewer(request).see_all)
 
 
 def _vm_target_for_task(task_id):
@@ -101,6 +160,11 @@ def _vm_target_for_task(task_id):
     # be running someone else's task while this one is pending.
     guest = getattr(task, "guest", None)
     if not guest or not getattr(guest, "label", None):
+        from lib.tenancy.storage.guac import worker_vm_for_task
+
+        w_label, w_ip = worker_vm_for_task(int(task_id))
+        if w_label:
+            return w_label, (w_ip or "")
         return "", None
     machine = db.view_machine_by_label(guest.label)
     return guest.label, (getattr(machine, "ip", "") or "")
@@ -125,9 +189,13 @@ def index(request, task_id, session_data):
     if not label:
         return _error(request, task_id, "No VM is associated with this task")
 
+    from lib.tenancy.storage.guac import libvirt_dsn_for_task
+
+    dsn, _worker_ip = libvirt_dsn_for_task(int(task_id), machinery_dsn)
+
     conn = None
     try:
-        conn = libvirt.open(machinery_dsn)
+        conn = libvirt.open(dsn)
         if not conn:
             return _error(request, task_id, "Could not connect to hypervisor")
 
@@ -147,12 +215,13 @@ def index(request, task_id, session_data):
         recording_name = f"{task_id}_{session_id}"
         token = uuid.uuid4()
 
-        guac_session = db.create_guac_session(
-            token=token,
-            task_id=int(task_id),
-            vm_label=label,
-            guest_ip=guest_ip,
-        )
+        with db.transaction():
+            guac_session = db.create_guac_session(
+                token=token,
+                task_id=int(task_id),
+                vm_label=label,
+                guest_ip=guest_ip,
+            )
 
         response = render(request, "guac/index.html", {
             "session_id": session_id,
@@ -184,14 +253,18 @@ def direct_vnc_host_port(request, host, port):
     if not is_vnc_console_enabled():
         return _error(request, 0, "VNC Console is disabled in configuration")
 
+    if not _is_direct_vnc_authorized(request):
+        return _error(request, 0, "VNC Console is restricted to administrators", status=403)
+
     token = uuid.uuid4()
     try:
-        guac_session = db.create_guac_session(
-            token=token,
-            task_id=0,
-            vm_label=str(port),
-            guest_ip=host,
-        )
+        with db.transaction():
+            guac_session = db.create_guac_session(
+                token=token,
+                task_id=0,
+                vm_label=str(port),
+                guest_ip=host,
+            )
     except Exception as e:
         return _error(request, 0, f"Failed to create Guacamole session: {e}")
 
@@ -222,6 +295,9 @@ def direct_vnc_host_port(request, host, port):
 def direct_vnc_vm(request, vm_name):
     if not is_vnc_console_enabled():
         return _error(request, 0, "VNC Console is disabled in configuration")
+
+    if not _is_direct_vnc_authorized(request):
+        return _error(request, 0, "VNC Console is restricted to administrators", status=403)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -260,7 +336,7 @@ def direct_vnc_vm(request, vm_name):
                         if not current_snapshot:
                             current_snapshot = request.session.get(f"snapshot_{vm_name}")
                             if not current_snapshot:
-                                machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+                                machine = _view_vm_machine(vm_name)
                                 if machine and machine.snapshot:
                                     current_snapshot = machine.snapshot
             except Exception as e:
@@ -284,8 +360,8 @@ def direct_vnc_vm(request, vm_name):
     override = request.GET.get("override") == "true"
     if is_running and not override:
         from lib.cuckoo.core.data.guac_session import GuacSession
-        session = db.session()
-        active_session = session.query(GuacSession).filter_by(vm_label=vm_name).first()
+        with db.transaction():
+            active_session = db.session.scalar(select(GuacSession.id).where(GuacSession.vm_label == vm_name).limit(1))
         if active_session:
             return render(request, "guac/warn.html", {"vm_name": vm_name})
 
@@ -293,19 +369,18 @@ def direct_vnc_vm(request, vm_name):
     if not is_running:
         try:
             from lib.cuckoo.core.data.guac_session import GuacSession
-            session = db.session()
-            session.query(GuacSession).filter_by(vm_label=vm_name).delete()
-            session.commit()
+            with db.transaction():
+                db.session.execute(delete(GuacSession).where(GuacSession.vm_label == vm_name))
         except Exception as e:
             logger.error("Failed to clear stale GuacSession for VM %s: %s", vm_name, e)
 
         is_starting = False
-        machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+        machine = _view_vm_machine(vm_name)
         if machine:
             if machine.locked_changed_on:
-                from datetime import datetime
+                from lib.cuckoo.core.data.db_common import _utcnow_naive
                 # Check if it was locked within the last 90 seconds (startup window)
-                delta = datetime.utcnow() - machine.locked_changed_on
+                delta = _utcnow_naive() - machine.locked_changed_on
                 is_starting = delta.total_seconds() < 90
 
             if is_starting:
@@ -316,36 +391,21 @@ def direct_vnc_vm(request, vm_name):
             elif machine.locked:
                 # Check if this lock belongs to a legitimate active CAPE analysis task
                 try:
-                    from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
-
-                    session = db.session()
-                    active_task = session.query(Task).filter(
-                        Task.machine_id == machine.id,
-                        Task.status == TASK_RUNNING
-                    ).first()
-
-                    active_guest = session.query(Guest).filter(
-                        Guest.label == vm_name,
-                        Guest.shutdown_on.is_(None)
-                    ).first()
+                    active_task_id, active_guest = _active_task_and_guest(machine.id, vm_name)
                 except Exception as query_err:
                     logger.error("Failed to query active tasks/guests: %s", query_err)
-                    active_task = None
-                    active_guest = None
+                    active_task_id, active_guest = None, False
 
-                if active_task or active_guest:
+                if active_task_id or active_guest:
                     # Legitimate task is active, DO NOT unlock! Show wait screen.
                     return render(request, "guac/wait.html", {
                         "vm_name": vm_name,
-                        "task_id": active_task.id if active_task else 0,
+                        "task_id": active_task_id or 0,
                     })
                 else:
                     # No active task/guest and no active console startup -> stale lock!
                     try:
-                        db.unlock_machine(machine)
-                        db.session.commit()
+                        _set_machine_locked(machine, False)
                         logger.info("Automatically unlocked stale machine lock for VM '%s'", vm_name)
                     except Exception as db_err:
                         logger.error("Failed to unlock stale machine lock for '%s': %s", vm_name, db_err)
@@ -359,19 +419,20 @@ def direct_vnc_vm(request, vm_name):
 
     token = uuid.uuid4()
     try:
-        guac_session = db.create_guac_session(
-            token=token,
-            task_id=0,
-            vm_label=vm_name,
-            guest_ip="",
-        )
+        with db.transaction():
+            guac_session = db.create_guac_session(
+                token=token,
+                task_id=0,
+                vm_label=vm_name,
+                guest_ip="",
+            )
     except Exception as e:
         return _error(request, 0, f"Failed to create Guacamole session: {e}")
 
     recording_name = f"direct_{vm_name}_{str(token)[:8]}"
 
     # Determine if it was started by the VNC Console
-    machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+    machine = _view_vm_machine(vm_name)
     started_by_console = True
 
     # Determine configured VPNs and Tor/Internet routing options
@@ -437,7 +498,7 @@ def bg_revert_and_start(machinery_dsn, vm_name, start_mode, snapshot_name):
 
             # Enforce 'none' (no internet) route by default
             try:
-                machine = db.view_machine_by_label(vm_name)
+                machine = _view_vm_machine(vm_name)
                 if machine:
                     from utils.router_manager import route_enable
                     route_enable("none", None, None, machine, None, None)
@@ -447,7 +508,7 @@ def bg_revert_and_start(machinery_dsn, vm_name, start_mode, snapshot_name):
 
             # Wait for the agent to become available and sync the clock to America/New_York (EST/EDT) zone
             try:
-                machine = db.view_machine_by_label(vm_name)
+                machine = _view_vm_machine(vm_name)
                 if machine:
                     import socket
                     import time
@@ -502,7 +563,7 @@ def bg_revert_and_start(machinery_dsn, vm_name, start_mode, snapshot_name):
                             tz = pytz.timezone("America/New_York")
                             now_est = datetime.datetime.now(tz)
                         except ImportError:
-                            now_utc = datetime.datetime.utcnow()
+                            now_utc = datetime.datetime.now(datetime.timezone.utc)
                             if 3 < now_utc.month < 11:
                                 offset = datetime.timedelta(hours=-4)
                             else:
@@ -576,7 +637,7 @@ sys.exit(res.returncode)
                                 logger.error("Execpy clock sync failed on VM '%s': %s", vm_name, exec_res.text)
 
                             try:
-                                session.post(f"http://{ip}:{port}/remove", data={"filepath": remote_script_path}, timeout=5.0)
+                                session.post(f"http://{ip}:{port}/remove", data={"path": remote_script_path}, timeout=5.0)
                             except Exception:
                                 pass
                         else:
@@ -590,10 +651,9 @@ sys.exit(res.returncode)
     except Exception as e:
         logger.error("Error starting VM %s in background: %s", vm_name, e)
         try:
-            machine = db.view_machine_by_label(vm_name)
+            machine = _view_vm_machine(vm_name)
             if machine:
-                db.unlock_machine(machine)
-                db.session.commit()
+                _set_machine_locked(machine, False)
         except Exception as db_err:
             logger.error("Failed to unlock machine %s after background start error: %s", vm_name, db_err)
     finally:
@@ -612,6 +672,9 @@ sys.exit(res.returncode)
 def direct_vnc_vm_start(request, vm_name):
     if not is_vnc_console_enabled():
         return _error(request, 0, "VNC Console is disabled in configuration")
+
+    if not _is_direct_vnc_authorized(request):
+        return _error(request, 0, "VNC Console is restricted to administrators", status=403)
 
     if not LIBVIRT_AVAILABLE:
         return _error(request, 0, "Libvirt not available")
@@ -643,33 +706,18 @@ def direct_vnc_vm_start(request, vm_name):
             return redirect("direct_vnc_vm", vm_name=vm_name)
 
         # Lock the machine in DB
-        machine = db.view_machine_by_label(vm_name)
+        machine = _view_vm_machine(vm_name)
         if machine:
             if machine.locked:
                 try:
-                    from lib.cuckoo.core.data.guests import Guest
-                    from lib.cuckoo.core.data.task import Task
-                    from lib.cuckoo.common.constants import TASK_RUNNING
-
-                    session = db.session()
-                    active_task = session.query(Task).filter(
-                        Task.machine_id == machine.id,
-                        Task.status == TASK_RUNNING
-                    ).first()
-
-                    active_guest = session.query(Guest).filter(
-                        Guest.label == vm_name,
-                        Guest.shutdown_on.is_(None)
-                    ).first()
+                    active_task_id, active_guest = _active_task_and_guest(machine.id, vm_name)
                 except Exception:
-                    active_task = None
-                    active_guest = None
+                    active_task_id, active_guest = None, False
 
-                if active_task or active_guest:
-                    return _error(request, active_task.id if active_task else 0, f"VM {vm_name} is currently in use by an active analysis task.")
+                if active_task_id or active_guest:
+                    return _error(request, active_task_id or 0, f"VM {vm_name} is currently in use by an active analysis task.")
 
-            db.lock_machine(machine)
-            db.session.commit()
+            _set_machine_locked(machine, True)
 
         snapshot_name = None
         if start_mode == "snapshot":
@@ -684,8 +732,7 @@ def direct_vnc_vm_start(request, vm_name):
 
             if not snapshot_name:
                 if machine:
-                    db.unlock_machine(machine)
-                    db.session.commit()
+                    _set_machine_locked(machine, False)
                 return _error(request, 0, f"No snapshot configured or found for VM {vm_name}")
 
             # Verify snapshot exists before starting thread
@@ -693,8 +740,7 @@ def direct_vnc_vm_start(request, vm_name):
                 dom.snapshotLookupByName(snapshot_name, flags=0)
             except Exception as e:
                 if machine:
-                    db.unlock_machine(machine)
-                    db.session.commit()
+                    _set_machine_locked(machine, False)
                 return _error(request, 0, f"Failed to restore snapshot: {e}")
 
         # Initialize route session to 'none' by default
@@ -724,6 +770,9 @@ def direct_vnc_vm_shutdown(request, vm_name):
     if not is_vnc_console_enabled():
         return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
 
+    if not _is_direct_vnc_authorized(request):
+        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
 
@@ -740,7 +789,7 @@ def direct_vnc_vm_shutdown(request, vm_name):
 
     force = data.get("force", False)
 
-    machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+    machine = _view_vm_machine(vm_name)
     conn = None
     try:
         conn = libvirt.open(machinery_dsn)
@@ -782,8 +831,7 @@ def direct_vnc_vm_shutdown(request, vm_name):
 
         # Unlock the machine in DB
         if machine:
-            db.unlock_machine(machine)
-            db.session.commit()
+            _set_machine_locked(machine, False)
 
         return JsonResponse({"status": "success"})
 
@@ -826,6 +874,9 @@ def direct_vnc_vm_route(request, vm_name):
     if not is_vnc_console_enabled():
         return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
 
+    if not _is_direct_vnc_authorized(request):
+        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "Invalid request method"}, status=405)
 
@@ -841,7 +892,8 @@ def direct_vnc_vm_route(request, vm_name):
     logger.info("direct_vnc_vm_route: Received route change request for VM '%s' to target_route: '%s'", vm_name, target_route)
 
     # Load machine configuration
-    machine = db.view_machine_by_label(vm_name)
+    with db.transaction():
+        machine = db.view_machine_by_label(vm_name)
     if not machine:
         logger.error("direct_vnc_vm_route: VM '%s' not found in database", vm_name)
         return JsonResponse({"status": "error", "message": f"VM {vm_name} not found"}, status=404)
@@ -912,6 +964,9 @@ def direct_vnc_vm_snapshots_list(request, vm_name):
     if not is_vnc_console_enabled():
         return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
 
+    if not _is_direct_vnc_authorized(request):
+        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
+
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
 
@@ -944,11 +999,11 @@ def direct_vnc_vm_snapshots_list(request, vm_name):
         if not current_snapshot:
             current_snapshot = request.session.get(f"snapshot_{vm_name}")
             if not current_snapshot:
-                machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+                machine = _view_vm_machine(vm_name)
                 if machine and machine.snapshot:
                     current_snapshot = machine.snapshot
 
-        machine = db.view_machine_by_label(vm_name) or db.view_machine(vm_name)
+        machine = _view_vm_machine(vm_name)
         default_snapshot = machine.snapshot if (machine and machine.snapshot) else None
 
         return JsonResponse({
@@ -971,6 +1026,9 @@ def direct_vnc_vm_snapshots_list(request, vm_name):
 def direct_vnc_vm_snapshot_create(request, vm_name):
     if not is_vnc_console_enabled():
         return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+
+    if not _is_direct_vnc_authorized(request):
+        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -1037,13 +1095,10 @@ def direct_vnc_vm_snapshot_create(request, vm_name):
             logger.error("Failed to create snapshot '%s' for VM '%s': %s", snapshot_name, vm_name, e)
             return JsonResponse({"status": "error", "message": f"Failed to create snapshot: {e}"}, status=500)
 
-        machine = db.view_machine_by_label(vm_name)
-        if machine:
-            try:
-                machine.snapshot = snapshot_name
-                db.session.commit()
-            except Exception as db_err:
-                logger.error("Failed to update default snapshot in database for '%s': %s", vm_name, db_err)
+        try:
+            _set_machine_snapshot(vm_name, snapshot_name)
+        except Exception as db_err:
+            logger.error("Failed to update default snapshot in database for '%s': %s", vm_name, db_err)
 
         return JsonResponse({"status": "success", "message": f"Snapshot '{snapshot_name}' created successfully"})
     except Exception as e:
@@ -1060,6 +1115,9 @@ def direct_vnc_vm_snapshot_create(request, vm_name):
 def direct_vnc_vm_snapshot_delete(request, vm_name):
     if not is_vnc_console_enabled():
         return JsonResponse({"status": "error", "message": "VNC Console is disabled in configuration"}, status=403)
+
+    if not _is_direct_vnc_authorized(request):
+        return JsonResponse({"status": "error", "message": "VNC Console is restricted to administrators"}, status=403)
 
     if not LIBVIRT_AVAILABLE:
         return JsonResponse({"status": "error", "message": "Libvirt not available"}, status=500)
@@ -1105,7 +1163,8 @@ def direct_vnc_vm_snapshot_delete(request, vm_name):
             logger.error("Failed to delete snapshot '%s' for VM '%s': %s", snapshot_name, vm_name, e)
             return JsonResponse({"status": "error", "message": f"Failed to delete snapshot: {e}"}, status=500)
 
-        machine = db.view_machine_by_label(vm_name)
+        with db.transaction():
+            machine = db.view_machine_by_label(vm_name)
         if machine and machine.snapshot == snapshot_name:
             try:
                 try:
@@ -1113,12 +1172,7 @@ def direct_vnc_vm_snapshot_delete(request, vm_name):
                 except Exception:
                     remaining = []
 
-                if remaining:
-                    machine.snapshot = remaining[0]
-                else:
-                    machine.snapshot = None
-
-                db.session.commit()
+                _set_machine_snapshot(vm_name, remaining[0] if remaining else None)
             except Exception as db_err:
                 logger.error("Failed to update/clear machine snapshot in DB after deletion: %s", db_err)
 
